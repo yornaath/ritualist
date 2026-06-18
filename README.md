@@ -14,7 +14,7 @@ either completing the activity or snoozing it.
 [crates-badge]: https://img.shields.io/crates/v/ritualist.svg
 [crates-url]: https://crates.io/crates/ritualist
 [mit-badge]: https://img.shields.io/badge/license-MIT-blue.svg
-[mit-url]: https://github.com/yornaath/ritualist/blob/master/LICENSE
+[mit-url]: https://github.com/yornaath/ritualist/blob/main/LICENSE
 
 ## Features
 
