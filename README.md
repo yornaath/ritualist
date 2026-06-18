@@ -10,11 +10,14 @@ either completing the activity or snoozing it.
 
 [![Crates.io][crates-badge]][crates-url]
 [![MIT licensed][mit-badge]][mit-url]
+[![CI][ci-badge]][ci-url]
 
 [crates-badge]: https://img.shields.io/crates/v/ritualist.svg
 [crates-url]: https://crates.io/crates/ritualist
 [mit-badge]: https://img.shields.io/badge/license-MIT-blue.svg
 [mit-url]: https://github.com/yornaath/ritualist/blob/main/LICENSE
+[ci-badge]: https://github.com/yornaath/ritualist/actions/workflows/ci.yml/badge.svg
+[ci-url]: https://github.com/yornaath/ritualist/actions/workflows/ci.yml
 
 Used by the [Glimt](https://www.glimtapp.io/) app. A breathwork coaching and reminder app for osx.
 
