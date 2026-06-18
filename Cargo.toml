@@ -2,6 +2,14 @@
 name = "ritualist"
 version = "0.0.9"
 edition = "2024"
+authors = ["Yornaath"]
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/yornaath/ritualist"
+description = """
+App activity manager. Schedule app tasks like reminders etc at given intervals.
+"""
+categories = ["asynchronous", "reminders", "activities", "app", "cron"]
 
 [features]
 test-util = []
