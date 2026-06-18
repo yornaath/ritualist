@@ -24,6 +24,12 @@ enum Command<T: ActivityId> {
         specs: Vec<ActivitySpec<T>>,
         reply: oneshot::Sender<Result<(), SchedulerError>>,
     },
+    Reset {
+        spec: ActivitySpec<T>,
+    },
+    ResetMany {
+        specs: Vec<ActivitySpec<T>>,
+    },
     Tick,
     SetEnabled {
         id: T,
@@ -63,6 +69,14 @@ where
         let (reply, rx) = oneshot::channel();
         let _ = self.tx.send(Command::RegisterMany { specs, reply }).await;
         rx.await.unwrap()
+    }
+
+    pub async fn reset(&self, spec: ActivitySpec<T>) {
+        let _ = self.tx.send(Command::Reset { spec }).await;
+    }
+
+    pub async fn reset_many(&self, specs: Vec<ActivitySpec<T>>) {
+        let _ = self.tx.send(Command::ResetMany { specs }).await;
     }
 
     pub async fn tick(&self) {
@@ -133,10 +147,23 @@ where
                 let _ = reply.send(Ok(()));
             }
 
-            Command::Tick => {
-                for activity in self.activities.values_mut() {
-                    activity.tick();
+            Command::Reset { spec } => {
+                self.activities
+                    .insert(spec.id, Activity::new(spec, self.clock.clone()));
+            }
+
+            Command::ResetMany { specs } => {
+                for spec in specs {
+                    self.activities
+                        .insert(spec.id, Activity::new(spec, self.clock.clone()));
                 }
+            }
+
+            Command::Tick => {
+                self.activities.retain(|_id, activity| {
+                    activity.tick();
+                    activity.state != ActivityState::Gc
+                });
             }
 
             Command::SetEnabled { id, enabled } => {
@@ -427,7 +454,11 @@ mod tests {
 
         let due = h.advance_and_claim(Duration::from_secs(100)).await;
 
-        assert_eq!(due, vec![1], "only the 50s activity should be due at t=100s");
+        assert_eq!(
+            due,
+            vec![1],
+            "only the 50s activity should be due at t=100s"
+        );
         assert_eq!(h.state_of(1).await, Some(ActivityState::Running));
         assert_eq!(h.state_of(2).await, Some(ActivityState::Idle));
 
@@ -481,7 +512,11 @@ mod tests {
         h.schedule.register(spec(1, fixed(100))).await.unwrap();
 
         h.schedule.set_enabled(1, false).await;
-        assert!(h.advance_and_claim(Duration::from_secs(100)).await.is_empty());
+        assert!(
+            h.advance_and_claim(Duration::from_secs(100))
+                .await
+                .is_empty()
+        );
 
         h.schedule.set_enabled(1, true).await;
         // The disabled window did not accumulate, so it must elapse afresh.
@@ -536,7 +571,11 @@ mod tests {
         );
 
         // Not due before the snooze elapses, due once it does.
-        assert!(h.advance_and_claim(Duration::from_secs(29)).await.is_empty());
+        assert!(
+            h.advance_and_claim(Duration::from_secs(29))
+                .await
+                .is_empty()
+        );
         assert_eq!(h.advance_and_claim(Duration::from_secs(1)).await, vec![1]);
 
         h.shutdown().await;
@@ -547,8 +586,7 @@ mod tests {
         let start = Utc::now();
         let clock = TestClock::new(start);
         let token = CancellationToken::new();
-        let (schedule, handle) =
-            spawn_scheduler::<u32>(16, token.clone(), Arc::new(clock.clone()));
+        let (schedule, handle) = spawn_scheduler::<u32>(16, token.clone(), Arc::new(clock.clone()));
 
         let target = start + chrono::Duration::seconds(100);
         schedule
@@ -570,12 +608,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ticking_disabled_scheduled_task_past_target_garbage_collects() {
+        let start = Utc::now();
+        let clock = TestClock::new(start);
+        let token = CancellationToken::new();
+        let (schedule, handle) = spawn_scheduler::<u32>(16, token.clone(), Arc::new(clock.clone()));
+
+        let target = start + chrono::Duration::seconds(100);
+        schedule
+            .register(spec(1, ActivitySchedule::Scheduled { date: target }))
+            .await
+            .unwrap();
+
+        let _ = schedule.set_enabled(1, false).await;
+
+        clock.advance(Duration::from_secs(50));
+        schedule.tick().await;
+
+        assert_eq!(schedule.snapshot().await.len(), 1);
+        assert_eq!(schedule.claim_due().await.len(), 0);
+
+        clock.advance(Duration::from_secs(51));
+        schedule.tick().await;
+
+        assert_eq!(schedule.snapshot().await.len(), 0);
+        assert_eq!(schedule.claim_due().await.len(), 0);
+
+        token.cancel();
+        let _ = handle.await;
+    }
+
+    #[tokio::test]
     async fn finish_snooze_on_scheduled_activity_keeps_it() {
         let start = Utc::now();
         let clock = TestClock::new(start);
         let token = CancellationToken::new();
-        let (schedule, handle) =
-            spawn_scheduler::<u32>(16, token.clone(), Arc::new(clock.clone()));
+        let (schedule, handle) = spawn_scheduler::<u32>(16, token.clone(), Arc::new(clock.clone()));
 
         let target = start + chrono::Duration::seconds(100);
         schedule
