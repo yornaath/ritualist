@@ -115,7 +115,7 @@ async fn main() {
 
     // Take the receiving end *before* starting the scheduler.
     let mut channel = ritualist.take_channel();
-    let _running = ritualist.run();
+    ritualist.run();
 
     while let Some((activity, ack)) = channel.recv().await {
         activity.run(ack);
