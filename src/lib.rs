@@ -3,7 +3,7 @@ use crate::{
     activity::{Activity, ActivityId},
     activity_spec::{ActivitySpec, ActivitySpecError},
     clock::{Clock, SystemClock},
-    schedule::{Schedule, spawn_scheduler},
+    schedule::{Schedule, SchedulerError, spawn_scheduler},
 };
 use std::{fmt::Debug, hash::Hash, sync::Arc, time::Duration};
 use tokio::{
@@ -142,31 +142,26 @@ where
     ///
     /// Hash of T: [`activity::ActivityId`] is treated as the activities unique identifier
     /// and will be used when storing the activity. Registering
-    pub async fn register(&self, spec: ActivitySpec<T>) -> Result<(), ActivitySpecError> {
-        spec.validate()?;
-        self.scheduler.register(spec).await;
+    pub async fn register(&self, spec: ActivitySpec<T>) -> Result<(), RitualistError> {
+        spec.validate().map_err(RitualistError::ActivitySpecError)?;
+
+        self.scheduler
+            .register(spec)
+            .await
+            .map_err(RitualistError::ScheulerError)?;
+
         Ok(())
     }
 
-    pub async fn register_many(
-        &self,
-        specs: Vec<ActivitySpec<T>>,
-    ) -> Result<(), Vec<ActivitySpecError>> {
-        let errors: Vec<ActivitySpecError> = specs
-            .iter()
-            .filter_map(|s| {
-                if let Err(error) = s.validate() {
-                    return Some(error);
-                }
-                None
-            })
-            .collect();
-
-        if !errors.is_empty() {
-            return Err(errors);
+    pub async fn register_many(&self, specs: Vec<ActivitySpec<T>>) -> Result<(), RitualistError> {
+        for spec in &specs {
+            spec.validate().map_err(RitualistError::ActivitySpecError)?;
         }
 
-        self.scheduler.register_many(specs).await;
+        self.scheduler
+            .register_many(specs)
+            .await
+            .map_err(RitualistError::ScheulerError)?;
 
         Ok(())
     }
@@ -227,7 +222,7 @@ where
         });
 
         RunningRitualist {
-            schedule: self.scheduler.clone(),
+            scheduler: self.scheduler.clone(),
             scheduler_handle: self.scheduler_handle,
             polling_handle: handle,
             cancellation_token: cancellation_token,
@@ -241,7 +236,7 @@ pub struct RunningRitualist<T>
 where
     T: ActivityId,
 {
-    schedule: Schedule<T>,
+    scheduler: Schedule<T>,
     polling_handle: JoinHandle<()>,
     scheduler_handle: JoinHandle<()>,
     poll_token: tokio_util::sync::CancellationToken,
@@ -251,37 +246,35 @@ impl<T> RunningRitualist<T>
 where
     T: Debug + PartialEq + Eq + Hash + Send + Copy + 'static,
 {
-    pub async fn register(&self, spec: ActivitySpec<T>) -> Result<(), ActivitySpecError> {
-        spec.validate()?;
-        self.schedule.register(spec).await;
+    pub async fn register(&self, spec: ActivitySpec<T>) -> Result<(), RitualistError> {
+        spec.validate().map_err(RitualistError::ActivitySpecError)?;
+
+        self.scheduler
+            .register(spec)
+            .await
+            .map_err(RitualistError::ScheulerError)?;
+
         Ok(())
     }
 
     pub async fn register_many(
         &mut self,
         specs: Vec<ActivitySpec<T>>,
-    ) -> Result<(), Vec<ActivitySpecError>> {
-        let errors: Vec<ActivitySpecError> = specs
-            .iter()
-            .filter_map(|s| {
-                if let Err(error) = s.validate() {
-                    return Some(error);
-                }
-                None
-            })
-            .collect();
-
-        if !errors.is_empty() {
-            return Err(errors);
+    ) -> Result<(), RitualistError> {
+        for spec in &specs {
+            spec.validate().map_err(RitualistError::ActivitySpecError)?;
         }
 
-        self.schedule.register_many(specs).await;
+        self.scheduler
+            .register_many(specs)
+            .await
+            .map_err(RitualistError::ScheulerError)?;
 
         Ok(())
     }
 
     pub async fn set_enabled(&self, id: T, enabled: bool) {
-        self.schedule.set_enabled(id, enabled).await;
+        self.scheduler.set_enabled(id, enabled).await;
     }
 
     pub fn handle(&self) -> &JoinHandle<()> {
@@ -293,7 +286,7 @@ where
     }
 
     pub async fn snapshot(&self) -> Vec<Activity<T>> {
-        self.schedule.snapshot().await
+        self.scheduler.snapshot().await
     }
 
     pub async fn shutdown(self) -> Result<(), tokio::task::JoinError> {
@@ -307,4 +300,13 @@ where
         self.polling_handle.abort();
         self.scheduler_handle.abort();
     }
+}
+
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum RitualistError {
+    #[error("An error with the validation of the ActivitySpec.")]
+    ActivitySpecError(ActivitySpecError),
+    #[error("An error happend in the scheulder.")]
+    ScheulerError(SchedulerError),
 }
