@@ -1,12 +1,11 @@
 use crate::{
     ack::AckMessage,
     activation_target::ActivationTarget,
-    activity_spec::{ActivitySchedule, ActivitySpec}, clock::{Clock, Instant},
+    activity_spec::{ActivitySchedule, ActivitySpec},
+    clock::{Clock, Instant},
 };
 use chrono::{DateTime, Utc};
-use std::{
-    fmt::Debug, hash::Hash, sync::Arc, time::Duration
-};
+use std::{fmt::Debug, hash::Hash, sync::Arc, time::Duration};
 
 pub trait ActivityId: Debug + Eq + Hash + Copy + Send + 'static {}
 impl<T: Debug + Eq + Hash + Copy + Send + 'static> ActivityId for T {}
@@ -23,7 +22,7 @@ where
     /// For interval tasks this represents the elapsed clock time, used to check against `activation_target`
     /// to see if the activity should run or not.
     pub duration_delta: Duration,
-    /// The target for the activation of the activity. Either an elapsed duration for interval tasks or 
+    /// The target for the activation of the activity. Either an elapsed duration for interval tasks or
     /// dates for scheduled tasks.
     pub activation_target: ActivationTarget,
     /// The last monotonic tick time
@@ -33,7 +32,7 @@ where
     /// When the task was created, not used. But can be handy for consumers.
     pub created_at: DateTime<Utc>,
     /// Internal clock used to schedule.
-    clock: Arc<dyn Clock>
+    clock: Arc<dyn Clock>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -43,6 +42,7 @@ pub enum ActivityState {
     Snoozed(Duration),
     Disabled(Box<ActivityState>),
     Completed,
+    Gc,
 }
 
 impl ActivityState {
@@ -69,14 +69,14 @@ where
             last_tick: clock.now(),
             last_run_at: None,
             created_at: clock.now_utc(),
-            clock: clock
+            clock: clock,
         }
     }
 
     /// Tick the activity
-    /// 
+    ///
     /// This is used to advance the time of the activity.
-    /// 
+    ///
     /// This will update the last_tick and set the current duration delta to the duration
     /// between now and the last tick.
     pub(crate) fn tick(&mut self) {
@@ -88,13 +88,29 @@ where
         if self.state.is_scheduled() {
             self.duration_delta += tick_delta;
         }
+
+        self.try_gc_mark()
+    }
+
+    /// Mark the activity as garbace collectable if the task meets the conditions:
+    /// - It is a schedule Date activity
+    /// - And the activity is disabled
+    /// - And the activity has reached its target date.
+    pub(crate) fn try_gc_mark(&mut self) {
+        if matches!(self.spec.schedule, ActivitySchedule::Scheduled { date: _ })
+            && matches!(self.state, ActivityState::Disabled(_))
+            && self.is_at_target()
+        {
+            self.state = ActivityState::Gc;
+            return;
+        }
     }
 
     /// Tries to claim the [`Activity`] if its due to run.
-    /// 
+    ///
     /// If its due to run the [`Activity`] will be transitioned into its [`ActivityState::Running`] state,
     /// and the id of the activity will be returned as a `Some(T)`
-    /// 
+    ///
     /// If its not due `None`` will be returned
     pub(crate) fn claim_if_due(&mut self) -> Option<T> {
         if self.should_run() {
@@ -107,7 +123,7 @@ where
     }
 
     /// Set the enabled state of the activity: _**indempotent safe**_
-    /// 
+    ///
     /// - When **enabling** will unwrap the previous state from the disabled state(if any) and
     ///   set the state back to what it was before it was disabled.
     /// - When **disabling** will set the current state to disabled wrapping the current state so it
@@ -124,9 +140,9 @@ where
     }
 
     /// Determine if the activity should run at this given `tick`
-    /// 
+    ///
     /// Only `Idle` and `Snoozed` activities are eligible to run.
-    /// If eligible it will check either 
+    /// If eligible it will check either
     /// - the internal `duration_delta` against the `duration_target` for [`ActivationTarget::Duration`]
     /// - that the `target_date` is greater than now for [`ActivationTarget::Date`]
     pub(crate) fn should_run(&self) -> bool {
@@ -134,6 +150,11 @@ where
             return false;
         }
 
+        self.is_at_target()
+    }
+
+    /// Check if the activity has reached its target duration(interval) or scheduled Date.
+    pub(crate) fn is_at_target(&self) -> bool {
         match self.activation_target {
             ActivationTarget::Duration(duration_target) => self.duration_delta >= duration_target,
             ActivationTarget::Date(target_date) => {
@@ -144,9 +165,9 @@ where
     }
 
     /// Apply the finish state transition to the activity
-    /// 
+    ///
     /// Takes a [`AckMessage`] and transitions the activity into its correct state.
-    /// - When [`AckMessage:Done`] put the activity into [`ActivityState::Idle`] 
+    /// - When [`AckMessage:Done`] put the activity into [`ActivityState::Idle`]
     ///   and calculate next activation target duration based on the activity spec.
     /// - When [`AckMessage:Snooze(duration)`] put the  activity into [`ActivityState::Snoozed(duration)`]
     ///   and calculate next activation target duration based on the snooze duration
@@ -537,7 +558,10 @@ mod tests {
         activity.finish(AckMessage::Snooze(snooze));
 
         assert_eq!(activity.state, ActivityState::Snoozed(snooze));
-        assert_eq!(activity.activation_target, ActivationTarget::Duration(snooze));
+        assert_eq!(
+            activity.activation_target,
+            ActivationTarget::Duration(snooze)
+        );
         assert_eq!(activity.duration_delta, Duration::ZERO);
         assert!(activity.last_run_at.is_some());
     }
@@ -569,7 +593,160 @@ mod tests {
         activity.finish(AckMessage::Snooze(snooze));
 
         assert_eq!(activity.state, ActivityState::Snoozed(snooze));
-        assert_eq!(activity.activation_target, ActivationTarget::Duration(snooze));
+        assert_eq!(
+            activity.activation_target,
+            ActivationTarget::Duration(snooze)
+        );
+    }
+
+    // ---- is_at_target -----------------------------------------------------
+
+    #[test]
+    fn is_at_target_false_for_duration_below_target() {
+        let clock = TestClock::new(Utc::now());
+        let mut activity = build(&clock, fixed(100));
+
+        clock.advance(Duration::from_secs(99));
+        activity.tick();
+
+        assert!(!activity.is_at_target());
+    }
+
+    #[test]
+    fn is_at_target_true_for_duration_at_target() {
+        let clock = TestClock::new(Utc::now());
+        let mut activity = build(&clock, fixed(100));
+
+        clock.advance(Duration::from_secs(100));
+        activity.tick();
+
+        assert!(activity.is_at_target());
+    }
+
+    #[test]
+    fn is_at_target_true_for_duration_over_target() {
+        let clock = TestClock::new(Utc::now());
+        let mut activity = build(&clock, fixed(100));
+
+        clock.advance(Duration::from_secs(150));
+        activity.tick();
+
+        assert!(activity.is_at_target());
+    }
+
+    #[test]
+    fn is_at_target_false_for_date_before_target() {
+        let start = Utc::now();
+        let target = start + chrono::Duration::seconds(100);
+        let clock = TestClock::new(start);
+        let activity = build(&clock, scheduled(target));
+
+        clock.advance(Duration::from_secs(99));
+
+        assert!(!activity.is_at_target());
+    }
+
+    #[test]
+    fn is_at_target_true_for_date_at_target() {
+        let start = Utc::now();
+        let target = start + chrono::Duration::seconds(100);
+        let clock = TestClock::new(start);
+        let activity = build(&clock, scheduled(target));
+
+        clock.advance(Duration::from_secs(100));
+
+        assert!(activity.is_at_target());
+    }
+
+    #[test]
+    fn is_at_target_true_for_date_after_target() {
+        let start = Utc::now();
+        let target = start + chrono::Duration::seconds(100);
+        let clock = TestClock::new(start);
+        let activity = build(&clock, scheduled(target));
+
+        clock.advance(Duration::from_secs(150));
+
+        assert!(activity.is_at_target());
+    }
+
+    // ---- try_gc_mark ------------------------------------------------------
+
+    #[test]
+    fn try_gc_mark_marks_disabled_scheduled_at_target_as_gc() {
+        let start = Utc::now();
+        let target = start + chrono::Duration::seconds(100);
+        let clock = TestClock::new(start);
+        let mut activity = build(&clock, scheduled(target));
+        activity.set_enabled(false);
+
+        clock.advance(Duration::from_secs(100));
+        activity.try_gc_mark();
+
+        assert_eq!(activity.state, ActivityState::Gc);
+    }
+
+    #[test]
+    fn try_gc_mark_leaves_disabled_scheduled_before_target() {
+        let start = Utc::now();
+        let target = start + chrono::Duration::seconds(100);
+        let clock = TestClock::new(start);
+        let mut activity = build(&clock, scheduled(target));
+        activity.set_enabled(false);
+
+        clock.advance(Duration::from_secs(50));
+        activity.try_gc_mark();
+
+        assert_eq!(
+            activity.state,
+            ActivityState::Disabled(Box::new(ActivityState::Idle))
+        );
+    }
+
+    #[test]
+    fn try_gc_mark_leaves_enabled_scheduled_at_target() {
+        let start = Utc::now();
+        let target = start + chrono::Duration::seconds(100);
+        let clock = TestClock::new(start);
+        let mut activity = build(&clock, scheduled(target));
+
+        clock.advance(Duration::from_secs(100));
+        activity.try_gc_mark();
+
+        assert_eq!(
+            activity.state, ActivityState::Idle,
+            "an enabled scheduled activity must not be garbage collected"
+        );
+    }
+
+    #[test]
+    fn try_gc_mark_leaves_disabled_interval_at_target() {
+        let clock = TestClock::new(Utc::now());
+        let mut activity = build(&clock, fixed(100));
+        activity.duration_delta = Duration::from_secs(100);
+        activity.set_enabled(false);
+
+        activity.try_gc_mark();
+
+        assert_eq!(
+            activity.state,
+            ActivityState::Disabled(Box::new(ActivityState::Idle)),
+            "interval activities are never garbage collected"
+        );
+    }
+
+    #[test]
+    fn tick_marks_disabled_scheduled_at_target_as_gc() {
+        let start = Utc::now();
+        let target = start + chrono::Duration::seconds(100);
+        let clock = TestClock::new(start);
+        let mut activity = build(&clock, scheduled(target));
+        activity.set_enabled(false);
+
+        clock.advance(Duration::from_secs(100));
+        activity.tick();
+
+        assert_eq!(activity.state, ActivityState::Gc);
     }
 
     // ---- calculate_progress_pct ------------------------------------------
