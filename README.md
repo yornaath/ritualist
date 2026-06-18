@@ -16,7 +16,7 @@ either completing the activity or snoozing it.
 [mit-badge]: https://img.shields.io/badge/license-MIT-blue.svg
 [mit-url]: https://github.com/yornaath/ritualist/blob/main/LICENSE
 
-Used by the [https://www.glimtapp.io/](Glimt app). A breathwork coaching and reminder app for osx.
+Used by the [Glimt](https://www.glimtapp.io/) app. A breathwork coaching and reminder app for osx.
 
 ## Features
 
