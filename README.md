@@ -240,8 +240,11 @@ for activity in running.snapshot().await {
 
 ## Registering after start
 
-Both `Ritualist` and `RunningRitualist` expose `register` and `register_many`,
-so you can add activities before or after calling `run()`.
+Both `Ritualist` and `RunningRitualist` deref to a shared `RitualistHandle`,
+which exposes `register`, `register_many`, `set_enabled`, and `snapshot`, so you
+can add activities before or after calling `run()`. The handle is cheap to clone,
+so you can hand one out and register activities concurrently while the ritualist
+is running.
 
 ```rust
 let running = ritualist.run();
