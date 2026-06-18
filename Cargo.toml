@@ -9,7 +9,8 @@ repository = "https://github.com/yornaath/ritualist"
 description = """
 App activity manager. Schedule app tasks like reminders etc at given intervals.
 """
-categories = ["asynchronous", "reminders", "activities", "app", "cron"]
+categories = ["asynchronous"]
+keywords = ["async", "non-blocking", "reminders", "apps", "notifications"]
 
 [features]
 test-util = []
