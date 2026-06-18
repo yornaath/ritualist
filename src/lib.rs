@@ -28,12 +28,40 @@ pub mod schedule;
 /// This is a main module for the [https://www.glimtapp.io] now open sourced.
 /// 
 /// Example:
-/// ```
+/// ```no_run
+/// use ritualist::{
+///     Ritualist,
+///     ack::AckMessage,
+///     activity_spec::{ActivitySchedule, ActivitySpec},
+/// };
+/// use std::time::Duration;
+/// use tokio::sync;
+///
+/// #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+/// enum Activity {
+///     Ping,
+///     Pong,
+/// }
+///
+/// impl Activity {
+///     fn run(&self, ack: sync::oneshot::Sender<AckMessage>) {
+///         let activity = *self;
+///         tokio::spawn(async move {
+///             match activity {
+///                 Activity::Ping => println!("pinged"),
+///                 Activity::Pong => println!("ponged"),
+///             }
+///             // Acknowledge the run so the activity gets re-scheduled.
+///             let _ = ack.send(AckMessage::Done);
+///         });
+///     }
+/// }
+///
 /// #[tokio::main]
 /// async fn main() {
 ///     // buffer = channel capacity, poll_interval = how often the scheduler ticks.
 ///     let mut ritualist = Ritualist::new(64, Duration::from_millis(100));
-/// 
+///
 ///     ritualist
 ///         .register_many(vec![
 ///             ActivitySpec {
@@ -49,14 +77,15 @@ pub mod schedule;
 ///                 },
 ///             },
 ///         ])
-///         .await;
-/// 
+///         .await
+///         .expect("invalid activity spec");
+///
 ///     // Take the receiving end *before* starting the scheduler.
 ///     let mut channel = ritualist.take_channel();
-///     
+///
 ///     // Start the clock
 ///     ritualist.run();
-///     
+///
 ///     // Listen to activities being started
 ///     while let Some((activity, ack)) = channel.recv().await {
 ///         activity.run(ack);
