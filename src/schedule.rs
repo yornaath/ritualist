@@ -16,8 +16,14 @@ use tokio::{
 
 #[derive(Debug)]
 enum Command<T: ActivityId> {
-    Register(ActivitySpec<T>),
-    RegisterMany(Vec<ActivitySpec<T>>),
+    Register {
+        spec: ActivitySpec<T>,
+        reply: oneshot::Sender<Result<(), SchedulerError>>,
+    },
+    RegisterMany {
+        specs: Vec<ActivitySpec<T>>,
+        reply: oneshot::Sender<Result<(), SchedulerError>>,
+    },
     Tick,
     SetEnabled {
         id: T,
@@ -47,12 +53,16 @@ impl<T> Schedule<T>
 where
     T: ActivityId,
 {
-    pub async fn register(&self, spec: ActivitySpec<T>) {
-        let _ = self.tx.send(Command::Register(spec)).await;
+    pub async fn register(&self, spec: ActivitySpec<T>) -> Result<(), SchedulerError> {
+        let (reply, rx) = oneshot::channel();
+        let _ = self.tx.send(Command::Register { spec, reply }).await;
+        rx.await.unwrap()
     }
 
-    pub async fn register_many(&self, specs: Vec<ActivitySpec<T>>) {
-        let _ = self.tx.send(Command::RegisterMany(specs)).await;
+    pub async fn register_many(&self, specs: Vec<ActivitySpec<T>>) -> Result<(), SchedulerError> {
+        let (reply, rx) = oneshot::channel();
+        let _ = self.tx.send(Command::RegisterMany { specs, reply }).await;
+        rx.await.unwrap()
     }
 
     pub async fn tick(&self) {
@@ -98,16 +108,29 @@ where
 {
     fn send(&mut self, cmd: Command<T>) {
         match cmd {
-            Command::Register(spec) => {
-                self.activities
-                    .insert(spec.id, Activity::new(spec, self.clock.clone()));
+            Command::Register { spec, reply } => {
+                if self.activities.contains_key(&spec.id) {
+                    let _ = reply.send(Err(SchedulerError::ActivityAlreadyRegistered));
+                } else {
+                    self.activities
+                        .insert(spec.id, Activity::new(spec, self.clock.clone()));
+
+                    let _ = reply.send(Ok(()));
+                }
             }
 
-            Command::RegisterMany(specs) => {
+            Command::RegisterMany { specs, reply } => {
                 for spec in specs {
+                    if self.activities.contains_key(&spec.id) {
+                        let _ = reply.send(Err(SchedulerError::ActivityAlreadyRegistered));
+                        return;
+                    }
+
                     self.activities
                         .insert(spec.id, Activity::new(spec, self.clock.clone()));
                 }
+
+                let _ = reply.send(Ok(()));
             }
 
             Command::Tick => {
@@ -146,6 +169,13 @@ where
             }
         }
     }
+}
+
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum SchedulerError {
+    #[error("this activity has been registered, maybe you want reset()")]
+    ActivityAlreadyRegistered,
 }
 
 pub(crate) fn spawn_scheduler<T>(

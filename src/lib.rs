@@ -20,13 +20,13 @@ pub mod clock;
 pub mod schedule;
 
 /// Ritualist
-/// 
+///
 /// The ritualist is the activity orchestrator where you can register activites to run at certain intervals
 /// or at given dates. For now there is no persistence and it is meant to be run in the background of native apps
 /// where the app wants to schedule reminders etc at given intervals.
-/// 
+///
 /// This is a main module for the [https://www.glimtapp.io] now open sourced.
-/// 
+///
 /// Example:
 /// ```no_run
 /// use ritualist::{
@@ -136,6 +136,12 @@ where
         ritualist
     }
 
+    /// Register a new activity
+    ///
+    /// Schedules a new activity to run at the given interval.
+    ///
+    /// Hash of T: [`activity::ActivityId`] is treated as the activities unique identifier
+    /// and will be used when storing the activity. Registering
     pub async fn register(&self, spec: ActivitySpec<T>) -> Result<(), ActivitySpecError> {
         spec.validate()?;
         self.scheduler.register(spec).await;
