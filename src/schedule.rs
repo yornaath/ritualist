@@ -207,3 +207,443 @@ where
 
     (Schedule { tx }, handle)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        ack::AckMessage,
+        activity::ActivityState,
+        activity_spec::{ActivitySchedule, ActivitySpec},
+        clock::TestClock,
+    };
+    use chrono::Utc;
+    use std::time::Duration;
+    use tokio_util::sync::CancellationToken;
+
+    fn fixed(secs: u64) -> ActivitySchedule {
+        ActivitySchedule::FixedInterval {
+            duration: Duration::from_secs(secs),
+        }
+    }
+
+    fn spec(id: u32, schedule: ActivitySchedule) -> ActivitySpec<u32> {
+        ActivitySpec { id, schedule }
+    }
+
+    /// A test harness owning the spawned scheduler actor, its handle to send
+    /// commands, and the [`TestClock`] driving it. Time only advances when the
+    /// test body calls [`TestClock::advance`], so every assertion is
+    /// deterministic and free of sleeps.
+    struct Harness {
+        schedule: Schedule<u32>,
+        clock: TestClock,
+        token: CancellationToken,
+        handle: JoinHandle<()>,
+    }
+
+    impl Harness {
+        fn new() -> Self {
+            let clock = TestClock::new(Utc::now());
+            let token = CancellationToken::new();
+            let (schedule, handle) =
+                spawn_scheduler::<u32>(16, token.clone(), Arc::new(clock.clone()));
+
+            Self {
+                schedule,
+                clock,
+                token,
+                handle,
+            }
+        }
+
+        /// Advance the clock, tick every activity, then return the ids the
+        /// scheduler considers due. The intermediate `snapshot` is a sync
+        /// barrier: because the actor is a single FIFO task, awaiting any
+        /// command guarantees the fire-and-forget `tick` was applied first.
+        async fn advance_and_claim(&self, by: Duration) -> Vec<u32> {
+            self.clock.advance(by);
+            self.schedule.tick().await;
+            let mut ids = self.schedule.claim_due().await;
+            ids.sort();
+            ids
+        }
+
+        async fn state_of(&self, id: u32) -> Option<ActivityState> {
+            self.schedule
+                .snapshot()
+                .await
+                .into_iter()
+                .find(|a| a.spec.id == id)
+                .map(|a| a.state)
+        }
+
+        async fn ids(&self) -> Vec<u32> {
+            let mut ids: Vec<u32> = self
+                .schedule
+                .snapshot()
+                .await
+                .into_iter()
+                .map(|a| a.spec.id)
+                .collect();
+            ids.sort();
+            ids
+        }
+
+        async fn shutdown(self) {
+            self.token.cancel();
+            let _ = self.handle.await;
+        }
+    }
+
+    // ---- register ---------------------------------------------------------
+
+    #[tokio::test]
+    async fn register_succeeds_and_appears_in_snapshot() {
+        let h = Harness::new();
+
+        let result = h.schedule.register(spec(1, fixed(60))).await;
+
+        assert!(result.is_ok());
+        assert_eq!(h.ids().await, vec![1]);
+        assert_eq!(h.state_of(1).await, Some(ActivityState::Idle));
+
+        h.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn register_duplicate_id_returns_error() {
+        let h = Harness::new();
+        h.schedule.register(spec(1, fixed(60))).await.unwrap();
+
+        let result = h.schedule.register(spec(1, fixed(999))).await;
+
+        assert!(matches!(
+            result,
+            Err(SchedulerError::ActivityAlreadyRegistered)
+        ));
+        // The original registration is left untouched.
+        assert_eq!(h.ids().await, vec![1]);
+
+        h.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn register_many_registers_every_spec() {
+        let h = Harness::new();
+
+        let result = h
+            .schedule
+            .register_many(vec![
+                spec(1, fixed(60)),
+                spec(2, fixed(120)),
+                spec(3, fixed(180)),
+            ])
+            .await;
+
+        assert!(result.is_ok());
+        assert_eq!(h.ids().await, vec![1, 2, 3]);
+
+        h.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn register_many_with_duplicate_returns_error() {
+        let h = Harness::new();
+        h.schedule.register(spec(1, fixed(60))).await.unwrap();
+
+        let result = h
+            .schedule
+            .register_many(vec![spec(2, fixed(60)), spec(1, fixed(60))])
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(SchedulerError::ActivityAlreadyRegistered)
+        ));
+
+        h.shutdown().await;
+    }
+
+    // ---- claim_due / tick -------------------------------------------------
+
+    #[tokio::test]
+    async fn claim_due_is_empty_with_no_activities() {
+        let h = Harness::new();
+
+        assert!(h.schedule.claim_due().await.is_empty());
+
+        h.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn activity_not_claimed_before_interval_elapses() {
+        let h = Harness::new();
+        h.schedule.register(spec(1, fixed(100))).await.unwrap();
+
+        let due = h.advance_and_claim(Duration::from_secs(99)).await;
+
+        assert!(due.is_empty());
+        assert_eq!(h.state_of(1).await, Some(ActivityState::Idle));
+
+        h.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn activity_claimed_once_interval_elapses() {
+        let h = Harness::new();
+        h.schedule.register(spec(1, fixed(100))).await.unwrap();
+
+        let due = h.advance_and_claim(Duration::from_secs(100)).await;
+
+        assert_eq!(due, vec![1]);
+        assert_eq!(h.state_of(1).await, Some(ActivityState::Running));
+
+        h.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn claimed_activity_is_not_reclaimed_until_finished() {
+        let h = Harness::new();
+        h.schedule.register(spec(1, fixed(100))).await.unwrap();
+
+        let first = h.advance_and_claim(Duration::from_secs(100)).await;
+        assert_eq!(first, vec![1]);
+
+        // Still Running, so a further tick + claim yields nothing.
+        let second = h.advance_and_claim(Duration::from_secs(100)).await;
+        assert!(second.is_empty());
+
+        h.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn claim_due_returns_only_the_activities_that_are_due() {
+        let h = Harness::new();
+        h.schedule
+            .register_many(vec![spec(1, fixed(50)), spec(2, fixed(200))])
+            .await
+            .unwrap();
+
+        let due = h.advance_and_claim(Duration::from_secs(100)).await;
+
+        assert_eq!(due, vec![1], "only the 50s activity should be due at t=100s");
+        assert_eq!(h.state_of(1).await, Some(ActivityState::Running));
+        assert_eq!(h.state_of(2).await, Some(ActivityState::Idle));
+
+        h.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn random_interval_is_not_due_below_min_and_due_at_max() {
+        let h = Harness::new();
+        h.schedule
+            .register(spec(
+                1,
+                ActivitySchedule::RandomInterval {
+                    min: Duration::from_secs(10),
+                    max: Duration::from_secs(20),
+                },
+            ))
+            .await
+            .unwrap();
+
+        // Below the minimum the target can never have been reached.
+        assert!(h.advance_and_claim(Duration::from_secs(9)).await.is_empty());
+        // At/above the maximum the target is guaranteed to have been reached.
+        assert_eq!(h.advance_and_claim(Duration::from_secs(11)).await, vec![1]);
+
+        h.shutdown().await;
+    }
+
+    // ---- set_enabled ------------------------------------------------------
+
+    #[tokio::test]
+    async fn disabled_activity_does_not_accumulate_and_is_not_due() {
+        let h = Harness::new();
+        h.schedule.register(spec(1, fixed(100))).await.unwrap();
+        h.schedule.set_enabled(1, false).await;
+
+        let due = h.advance_and_claim(Duration::from_secs(100)).await;
+
+        assert!(due.is_empty());
+        assert_eq!(
+            h.state_of(1).await,
+            Some(ActivityState::Disabled(Box::new(ActivityState::Idle)))
+        );
+
+        h.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn re_enabled_activity_resumes_scheduling() {
+        let h = Harness::new();
+        h.schedule.register(spec(1, fixed(100))).await.unwrap();
+
+        h.schedule.set_enabled(1, false).await;
+        assert!(h.advance_and_claim(Duration::from_secs(100)).await.is_empty());
+
+        h.schedule.set_enabled(1, true).await;
+        // The disabled window did not accumulate, so it must elapse afresh.
+        let due = h.advance_and_claim(Duration::from_secs(100)).await;
+
+        assert_eq!(due, vec![1]);
+
+        h.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn set_enabled_on_unknown_id_is_a_noop() {
+        let h = Harness::new();
+
+        h.schedule.set_enabled(42, false).await;
+
+        // Reaching here (snapshot replies) proves the actor did not panic.
+        assert!(h.ids().await.is_empty());
+
+        h.shutdown().await;
+    }
+
+    // ---- finish -----------------------------------------------------------
+
+    #[tokio::test]
+    async fn finish_done_reschedules_a_fixed_interval_activity() {
+        let h = Harness::new();
+        h.schedule.register(spec(1, fixed(100))).await.unwrap();
+
+        assert_eq!(h.advance_and_claim(Duration::from_secs(100)).await, vec![1]);
+        h.schedule.finish(1, AckMessage::Done).await;
+
+        assert_eq!(h.state_of(1).await, Some(ActivityState::Idle));
+        // After re-elapsing the interval it becomes due again.
+        assert_eq!(h.advance_and_claim(Duration::from_secs(100)).await, vec![1]);
+
+        h.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn finish_snooze_reschedules_for_the_snooze_duration() {
+        let h = Harness::new();
+        h.schedule.register(spec(1, fixed(100))).await.unwrap();
+        assert_eq!(h.advance_and_claim(Duration::from_secs(100)).await, vec![1]);
+
+        h.schedule
+            .finish(1, AckMessage::Snooze(Duration::from_secs(30)))
+            .await;
+        assert_eq!(
+            h.state_of(1).await,
+            Some(ActivityState::Snoozed(Duration::from_secs(30)))
+        );
+
+        // Not due before the snooze elapses, due once it does.
+        assert!(h.advance_and_claim(Duration::from_secs(29)).await.is_empty());
+        assert_eq!(h.advance_and_claim(Duration::from_secs(1)).await, vec![1]);
+
+        h.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn finish_done_on_scheduled_activity_removes_it() {
+        let start = Utc::now();
+        let clock = TestClock::new(start);
+        let token = CancellationToken::new();
+        let (schedule, handle) =
+            spawn_scheduler::<u32>(16, token.clone(), Arc::new(clock.clone()));
+
+        let target = start + chrono::Duration::seconds(100);
+        schedule
+            .register(spec(1, ActivitySchedule::Scheduled { date: target }))
+            .await
+            .unwrap();
+
+        clock.advance(Duration::from_secs(100));
+        schedule.tick().await;
+        assert_eq!(schedule.claim_due().await, vec![1]);
+
+        schedule.finish(1, AckMessage::Done).await;
+
+        // A completed one-shot activity is dropped from the scheduler.
+        assert!(schedule.snapshot().await.is_empty());
+
+        token.cancel();
+        let _ = handle.await;
+    }
+
+    #[tokio::test]
+    async fn finish_snooze_on_scheduled_activity_keeps_it() {
+        let start = Utc::now();
+        let clock = TestClock::new(start);
+        let token = CancellationToken::new();
+        let (schedule, handle) =
+            spawn_scheduler::<u32>(16, token.clone(), Arc::new(clock.clone()));
+
+        let target = start + chrono::Duration::seconds(100);
+        schedule
+            .register(spec(1, ActivitySchedule::Scheduled { date: target }))
+            .await
+            .unwrap();
+
+        clock.advance(Duration::from_secs(100));
+        schedule.tick().await;
+        assert_eq!(schedule.claim_due().await, vec![1]);
+
+        schedule
+            .finish(1, AckMessage::Snooze(Duration::from_secs(30)))
+            .await;
+
+        let state = schedule
+            .snapshot()
+            .await
+            .into_iter()
+            .find(|a| a.spec.id == 1)
+            .map(|a| a.state);
+        assert_eq!(state, Some(ActivityState::Snoozed(Duration::from_secs(30))));
+
+        token.cancel();
+        let _ = handle.await;
+    }
+
+    #[tokio::test]
+    async fn finish_on_unknown_id_is_a_noop() {
+        let h = Harness::new();
+        h.schedule.register(spec(1, fixed(100))).await.unwrap();
+
+        h.schedule.finish(99, AckMessage::Done).await;
+
+        assert_eq!(h.ids().await, vec![1]);
+        assert_eq!(h.state_of(1).await, Some(ActivityState::Idle));
+
+        h.shutdown().await;
+    }
+
+    // ---- snapshot & lifecycle --------------------------------------------
+
+    #[tokio::test]
+    async fn snapshot_returns_all_registered_activities() {
+        let h = Harness::new();
+        h.schedule
+            .register_many(vec![spec(1, fixed(60)), spec(2, fixed(120))])
+            .await
+            .unwrap();
+
+        let snapshot = h.schedule.snapshot().await;
+
+        assert_eq!(snapshot.len(), 2);
+
+        h.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn commands_after_cancellation_degrade_gracefully() {
+        let h = Harness::new();
+        h.schedule.register(spec(1, fixed(60))).await.unwrap();
+
+        h.token.cancel();
+        let _ = h.handle.await;
+
+        // The actor is gone; reply-bearing commands fall back to defaults
+        // instead of panicking.
+        assert!(h.schedule.claim_due().await.is_empty());
+        assert!(h.schedule.snapshot().await.is_empty());
+    }
+}
