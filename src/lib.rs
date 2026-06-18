@@ -5,7 +5,7 @@ use crate::{
     clock::{Clock, SystemClock},
     schedule::{Schedule, SchedulerError, spawn_scheduler},
 };
-use std::{fmt::Debug, hash::Hash, sync::Arc, time::Duration};
+use std::{ops::Deref, sync::Arc, time::Duration};
 use tokio::{
     select,
     sync::{mpsc::Receiver, oneshot::Sender},
@@ -92,6 +92,12 @@ pub mod schedule;
 ///     }
 /// }
 /// ```
+/// A cheap-to-clone handle for the state-independent operations on a ritualist.
+///
+/// Both [`Ritualist`] and [`RunningRitualist`] deref to this, so the shared
+/// operations (register, enable, snapshot) are defined exactly once. The handle
+/// is `Clone`, so it can be handed out and used to mutate the schedule
+/// concurrently, including while the ritualist is running.
 #[derive(Debug)]
 pub struct Ritualist<T>
 where
@@ -99,7 +105,7 @@ where
 {
     sender: tokio::sync::mpsc::Sender<Ack<T>>,
     receiver: Option<tokio::sync::mpsc::Receiver<Ack<T>>>,
-    scheduler: Schedule<T>,
+    scheduler: SchedulerHandle<T>,
     scheduler_handle: JoinHandle<()>,
     poll_interval: Duration,
     cancellation_token: tokio_util::sync::CancellationToken,
@@ -127,7 +133,7 @@ where
         let ritualist: Ritualist<T> = Ritualist {
             sender,
             receiver: Some(receiver),
-            scheduler: scheduler,
+            scheduler: SchedulerHandle { scheduler },
             scheduler_handle: scheduler_handle,
             poll_interval,
             cancellation_token: cancellation_token,
@@ -136,43 +142,13 @@ where
         ritualist
     }
 
-    /// Register a new activity
-    ///
-    /// Schedules a new activity to run at the given interval.
-    ///
-    /// Hash of T: [`activity::ActivityId`] is treated as the activities unique identifier
-    /// and will be used when storing the activity. Registering
-    pub async fn register(&self, spec: ActivitySpec<T>) -> Result<(), RitualistError> {
-        spec.validate().map_err(RitualistError::ActivitySpecError)?;
-
-        self.scheduler
-            .register(spec)
-            .await
-            .map_err(RitualistError::ScheulerError)?;
-
-        Ok(())
-    }
-
-    pub async fn register_many(&self, specs: Vec<ActivitySpec<T>>) -> Result<(), RitualistError> {
-        for spec in &specs {
-            spec.validate().map_err(RitualistError::ActivitySpecError)?;
-        }
-
-        self.scheduler
-            .register_many(specs)
-            .await
-            .map_err(RitualistError::ScheulerError)?;
-
-        Ok(())
-    }
-
     pub fn take_channel(&mut self) -> Receiver<(T, Sender<AckMessage>)> {
         self.receiver.take().unwrap()
     }
 
     pub fn run(self) -> RunningRitualist<T> {
         let poll_interval = self.poll_interval;
-        let schedule = self.scheduler.clone();
+        let schedule = self.scheduler.scheduler.clone();
         let sender = self.sender.clone();
 
         let mut ticker = tokio::time::interval(poll_interval);
@@ -222,7 +198,7 @@ where
         });
 
         RunningRitualist {
-            scheduler: self.scheduler.clone(),
+            scheduler: self.scheduler,
             scheduler_handle: self.scheduler_handle,
             polling_handle: handle,
             cancellation_token: cancellation_token,
@@ -231,12 +207,23 @@ where
     }
 }
 
+impl<T> Deref for Ritualist<T>
+where
+    T: ActivityId,
+{
+    type Target = SchedulerHandle<T>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.scheduler
+    }
+}
+
 #[derive(Debug)]
 pub struct RunningRitualist<T>
 where
     T: ActivityId,
 {
-    scheduler: Schedule<T>,
+    scheduler: SchedulerHandle<T>,
     polling_handle: JoinHandle<()>,
     scheduler_handle: JoinHandle<()>,
     poll_token: tokio_util::sync::CancellationToken,
@@ -244,49 +231,14 @@ where
 }
 impl<T> RunningRitualist<T>
 where
-    T: Debug + PartialEq + Eq + Hash + Send + Copy + 'static,
+    T: ActivityId,
 {
-    pub async fn register(&self, spec: ActivitySpec<T>) -> Result<(), RitualistError> {
-        spec.validate().map_err(RitualistError::ActivitySpecError)?;
-
-        self.scheduler
-            .register(spec)
-            .await
-            .map_err(RitualistError::ScheulerError)?;
-
-        Ok(())
-    }
-
-    pub async fn register_many(
-        &mut self,
-        specs: Vec<ActivitySpec<T>>,
-    ) -> Result<(), RitualistError> {
-        for spec in &specs {
-            spec.validate().map_err(RitualistError::ActivitySpecError)?;
-        }
-
-        self.scheduler
-            .register_many(specs)
-            .await
-            .map_err(RitualistError::ScheulerError)?;
-
-        Ok(())
-    }
-
-    pub async fn set_enabled(&self, id: T, enabled: bool) {
-        self.scheduler.set_enabled(id, enabled).await;
-    }
-
     pub fn handle(&self) -> &JoinHandle<()> {
         &self.polling_handle
     }
 
     pub async fn join(self) -> Result<(), tokio::task::JoinError> {
         self.polling_handle.await
-    }
-
-    pub async fn snapshot(&self) -> Vec<Activity<T>> {
-        self.scheduler.snapshot().await
     }
 
     pub async fn shutdown(self) -> Result<(), tokio::task::JoinError> {
@@ -299,6 +251,103 @@ where
     pub async fn abort(self) {
         self.polling_handle.abort();
         self.scheduler_handle.abort();
+    }
+}
+
+impl<T> Deref for RunningRitualist<T>
+where
+    T: ActivityId,
+{
+    type Target = SchedulerHandle<T>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.scheduler
+    }
+}
+
+/// Scheduler handle trait
+///
+/// Shared logic for scheduling methods like regsiter, set_enabled and snapshot
+/// that is shared between the [`Ritualist`] and the [`RunningRitualist`]
+#[derive(Debug, Clone)]
+pub struct SchedulerHandle<T>
+where
+    T: ActivityId,
+{
+    scheduler: Schedule<T>,
+}
+
+impl<T> SchedulerHandle<T>
+where
+    T: ActivityId,
+{
+    /// Schedules a new activity to run at the given interval.
+    ///
+    /// Hash of T: [`activity::ActivityId`] is treated as the activities unique identifier
+    /// and will be used when storing the activity in the scheduler.
+    ///
+    /// Will return an error if the activity is already registered.
+    pub async fn register(&self, spec: ActivitySpec<T>) -> Result<(), RitualistError> {
+        spec.validate().map_err(RitualistError::ActivitySpecError)?;
+
+        self.scheduler
+            .register(spec)
+            .await
+            .map_err(RitualistError::ScheulerError)?;
+
+        Ok(())
+    }
+
+    /// Same as register but for a batch.
+    /// Ref [`SchedulerHandle::register`]
+    pub async fn register_many(&self, specs: Vec<ActivitySpec<T>>) -> Result<(), RitualistError> {
+        for spec in &specs {
+            spec.validate().map_err(RitualistError::ActivitySpecError)?;
+        }
+
+        self.scheduler
+            .register_many(specs)
+            .await
+            .map_err(RitualistError::ScheulerError)?;
+
+        Ok(())
+    }
+
+    /// Reset a activitiy.
+    ///
+    /// Same as [`SchedulerHandle::resger`] but will overwrite and reschedule
+    /// the given activitiy.
+    pub async fn reset(&self, spec: ActivitySpec<T>) -> Result<(), RitualistError> {
+        spec.validate().map_err(RitualistError::ActivitySpecError)?;
+        self.scheduler.reset(spec).await;
+        Ok(())
+    }
+
+    /// Reset a set of activities.
+    ///
+    /// Same as [`SchedulerHandle::register_many`] but will overwrite and reschedule
+    /// the given activities.
+    pub async fn reset_many(&self, specs: Vec<ActivitySpec<T>>) -> Result<(), RitualistError> {
+        for spec in &specs {
+            spec.validate().map_err(RitualistError::ActivitySpecError)?;
+        }
+        self.scheduler.reset_many(specs).await;
+        Ok(())
+    }
+
+    /// Enable or disable a given task.
+    ///
+    /// - For interval scheduled tasks this will pause the timer.
+    /// - For date scheduled tasks this will omit emitting the activity event
+    ///   if the activity is disabled when it should have fired.
+    pub async fn set_enabled(&self, id: T, enabled: bool) {
+        self.scheduler.set_enabled(id, enabled).await;
+    }
+
+    /// Get a snapshot of the activities and their states currently in the scheduler
+    /// The activities are cloned and mutating them wont affect the scheduler state.
+    pub async fn snapshot(&self) -> Vec<Activity<T>> {
+        self.scheduler.snapshot().await
     }
 }
 
