@@ -54,7 +54,7 @@ enum Command<T: ActivityId> {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct Scheduler<T>
+pub struct Scheduler<T>
 where
     T: ActivityId,
 {

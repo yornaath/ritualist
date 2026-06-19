@@ -124,6 +124,10 @@ where
         ritualist
     }
 
+    /// Start the scheduler - all registered activities will start emitting.
+    ///
+    /// Consumes self and [`crate::RunningRitualist`]
+    /// Typesafe pattern Where Ritualist::run() -> RunningRitualist that cannot be run again.
     pub fn run(mut self) -> RunningRitualist<T> {
         let schedule = self.scheduler.clone();
         let receiver = self.driver.run(schedule);
