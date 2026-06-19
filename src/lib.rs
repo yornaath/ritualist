@@ -5,7 +5,7 @@ use crate::{
     driver::ScheduleDriver,
     schedule::{Scheduler, WithScheduler, spawn_scheduler},
 };
-use std::{sync::Arc, time::Duration};
+use std::{marker::PhantomData, sync::Arc, time::Duration};
 use tokio::sync::{mpsc::Receiver, oneshot::Sender};
 
 pub mod ack;
@@ -59,7 +59,7 @@ pub mod schedule;
 /// #[tokio::main]
 /// async fn main() {
 ///     // buffer = channel capacity, poll_interval = how often the scheduler ticks.
-///     let mut ritualist = Ritualist::new(64, Duration::from_millis(100));
+///     let mut ritualist = Ritualist::builder().build();
 ///
 ///     ritualist
 ///         .register_many(vec![
@@ -107,15 +107,11 @@ impl<T> Ritualist<T>
 where
     T: ActivityId,
 {
-    pub fn new(buffer: usize, poll_interval: Duration) -> Ritualist<T> {
-        Self::with_clock(buffer, poll_interval, Arc::new(SystemClock))
+    pub fn builder() -> RitualistBuilder<T> {
+        RitualistBuilder::new()
     }
 
-    pub fn with_clock(
-        buffer_size: usize,
-        poll_interval: Duration,
-        clock: Arc<dyn Clock>,
-    ) -> Ritualist<T> {
+    pub fn new(buffer_size: usize, poll_interval: Duration, clock: Arc<dyn Clock>) -> Ritualist<T> {
         let scheduler = spawn_scheduler(buffer_size, clock);
         let driver = ScheduleDriver::new(buffer_size, poll_interval);
 
@@ -145,6 +141,44 @@ where
 impl<T: ActivityId> WithScheduler<T> for Ritualist<T> {
     fn get_scheduler(&self) -> Scheduler<T> {
         self.scheduler.clone()
+    }
+}
+
+#[derive(Debug)]
+pub struct RitualistBuilder<T: ActivityId> {
+    buffer_size: usize,
+    poll_interval: Duration,
+    clock: Arc<dyn Clock>,
+    _state: PhantomData<T>,
+}
+
+impl<T: ActivityId> RitualistBuilder<T> {
+    pub fn new() -> RitualistBuilder<T> {
+        RitualistBuilder::<T> {
+            buffer_size: 256,
+            poll_interval: Duration::from_millis(500),
+            clock: Arc::new(SystemClock),
+            _state: PhantomData,
+        }
+    }
+
+    pub fn buffer_size(&mut self, buffer_size: usize) -> &Self {
+        self.buffer_size = buffer_size;
+        self
+    }
+
+    pub fn poll_interval(&mut self, interval: Duration) -> &Self {
+        self.poll_interval = interval;
+        self
+    }
+
+    pub fn clock(&mut self, clock: Arc<dyn Clock>) -> &Self {
+        self.clock = clock;
+        self
+    }
+
+    pub fn build(self) -> Ritualist<T> {
+        Ritualist::new(self.buffer_size, self.poll_interval, self.clock)
     }
 }
 

@@ -2,6 +2,7 @@ use ritualist::{
     Ritualist,
     ack::AckMessage,
     activity_spec::{ActivitySchedule, ActivitySpec},
+    clock::SystemClock,
     schedule::WithScheduler,
 };
 use std::{sync::Arc, thread::Result, time::Duration};
@@ -38,7 +39,7 @@ impl Activity {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let ritualist = Ritualist::new(64, Duration::from_millis(100));
+    let ritualist = Ritualist::builder().build();
 
     ritualist
         .register_many(vec![
