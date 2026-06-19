@@ -1,5 +1,5 @@
 use ritualist::{
-    Ritualist,
+    Ritualist, WithScheduler,
     ack::AckMessage,
     activity_spec::{ActivitySchedule, ActivitySpec},
 };
