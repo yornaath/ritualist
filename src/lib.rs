@@ -164,6 +164,11 @@ impl<T: ActivityId> RitualistBuilder<T> {
         }
     }
 
+    /// The capacity of the channels used to deliver due activities and
+    /// internal scheduler messages. A larger buffer lets more activities
+    /// queue up before back-pressure kicks in, at the cost of memory.
+    /// Set this higher if you schedule many activities that may fire in the
+    /// same tick. Defaults to 256.
     pub fn buffer_size(mut self, buffer_size: usize) -> Self {
         self.buffer_size = buffer_size;
         self.clone()
@@ -201,12 +206,16 @@ impl<T> RunningRitualist<T>
 where
     T: ActivityId,
 {
+    /// Gracefully shut down the driver and scheduler.
+    /// Leaves som room for running tasks to finish.
     pub async fn shutdown(self) -> Result<(), tokio::task::JoinError> {
         self.driver.shutdown().await?;
         self.scheduler.shutdown().await?;
         Ok(())
     }
 
+    /// Hard abort both driver and scheduler.
+    /// Will not leave room for activity tasks to finish.
     pub async fn abort(self) {
         self.driver.abort();
         self.scheduler.abort();
