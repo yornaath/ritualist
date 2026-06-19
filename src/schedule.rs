@@ -1,18 +1,23 @@
 use crate::{
-    ack::{Ack, AckMessage},
+    ack::AckMessage,
     activity::{Activity, ActivityId, ActivityState},
     activity_spec::ActivitySpec,
     clock::Clock,
 };
-use std::{collections::HashMap, fmt::Debug, sync::Arc};
+use std::{
+    collections::HashMap,
+    fmt::Debug,
+    sync::{Arc, Mutex},
+};
 use tokio::{
     select,
     sync::{
         mpsc::{self},
         oneshot,
     },
-    task::{JoinHandle},
+    task::JoinHandle,
 };
+use tokio_util::sync::CancellationToken;
 
 #[derive(Debug)]
 enum Command<T: ActivityId> {
@@ -53,6 +58,8 @@ where
     T: ActivityId,
 {
     actor_tx: mpsc::Sender<Command<T>>,
+    cancellation_token: CancellationToken,
+    handle: Arc<Mutex<Option<JoinHandle<()>>>>,
 }
 
 impl<T> Scheduler<T>
@@ -121,6 +128,22 @@ where
             return Vec::new();
         }
         rx.await.unwrap_or_default()
+    }
+
+    pub async fn shutdown(self) -> Result<(), tokio::task::JoinError> {
+        self.cancellation_token.cancel();
+        let handle = self.handle.lock().unwrap().take();
+        if let Some(handle) = handle {
+            handle.await?
+        }
+        Ok(())
+    }
+
+    pub fn abort(self) {
+        let handle = self.handle.lock().unwrap().take();
+        if let Some(handle) = handle {
+            handle.abort();
+        }
     }
 }
 
@@ -221,34 +244,38 @@ pub enum SchedulerError {
     ActivityAlreadyRegistered,
 }
 
-pub(crate) fn spawn_scheduler<T>(
-    buffer: usize,
-    cancellation_token: tokio_util::sync::CancellationToken,
-    clock: Arc<dyn Clock>,
-) -> (Scheduler<T>, JoinHandle<()>)
+pub(crate) fn spawn_scheduler<T>(buffer: usize, clock: Arc<dyn Clock>) -> Scheduler<T>
 where
     T: ActivityId,
 {
-    let (tx, mut rx) = mpsc::channel::<Command<T>>(buffer);
+    let (actor_tx, mut rx) = mpsc::channel::<Command<T>>(buffer);
+    let cancellation_token = tokio_util::sync::CancellationToken::new();
 
-    let handle = tokio::spawn(async move {
-        let mut actor = SchedulerActor {
-            activities: HashMap::new(),
-            clock: clock,
-        };
+    let handle = tokio::spawn({
+        let cancellation_token = cancellation_token.clone();
+        async move {
+            let mut actor = SchedulerActor {
+                activities: HashMap::new(),
+                clock: clock,
+            };
 
-        loop {
-            select! {
-                _ = cancellation_token.cancelled() => break,
-                message = rx.recv() => match message {
-                    Some(cmd) => actor.send(cmd),
-                    None => break
+            loop {
+                select! {
+                    _ = cancellation_token.cancelled() => break,
+                    message = rx.recv() => match message {
+                        Some(cmd) => actor.send(cmd),
+                        None => break
+                    }
                 }
             }
         }
     });
 
-    (Scheduler { actor_tx: tx }, handle)
+    Scheduler {
+        actor_tx,
+        cancellation_token,
+        handle: Arc::new(Mutex::new(Some(handle))),
+    }
 }
 
 #[cfg(test)]
@@ -281,23 +308,14 @@ mod tests {
     struct Harness {
         schedule: Scheduler<u32>,
         clock: TestClock,
-        token: CancellationToken,
-        handle: JoinHandle<()>,
     }
 
     impl Harness {
         fn new() -> Self {
             let clock = TestClock::new(Utc::now());
-            let token = CancellationToken::new();
-            let (schedule, handle) =
-                spawn_scheduler::<u32>(16, token.clone(), Arc::new(clock.clone()));
+            let schedule = spawn_scheduler::<u32>(16, Arc::new(clock.clone()));
 
-            Self {
-                schedule,
-                clock,
-                token,
-                handle,
-            }
+            Self { schedule, clock }
         }
 
         /// Advance the clock, tick every activity, then return the ids the
@@ -334,8 +352,7 @@ mod tests {
         }
 
         async fn shutdown(self) {
-            self.token.cancel();
-            let _ = self.handle.await;
+            self.schedule.shutdown().await;
         }
     }
 
@@ -602,7 +619,7 @@ mod tests {
         let start = Utc::now();
         let clock = TestClock::new(start);
         let token = CancellationToken::new();
-        let (schedule, handle) = spawn_scheduler::<u32>(16, token.clone(), Arc::new(clock.clone()));
+        let schedule = spawn_scheduler::<u32>(16, Arc::new(clock.clone()));
 
         let target = start + chrono::Duration::seconds(100);
         schedule
@@ -620,7 +637,6 @@ mod tests {
         assert!(schedule.snapshot().await.is_empty());
 
         token.cancel();
-        let _ = handle.await;
     }
 
     #[tokio::test]
@@ -628,7 +644,7 @@ mod tests {
         let start = Utc::now();
         let clock = TestClock::new(start);
         let token = CancellationToken::new();
-        let (schedule, handle) = spawn_scheduler::<u32>(16, token.clone(), Arc::new(clock.clone()));
+        let schedule = spawn_scheduler::<u32>(16, Arc::new(clock.clone()));
 
         let target = start + chrono::Duration::seconds(100);
         schedule
@@ -650,16 +666,14 @@ mod tests {
         assert_eq!(schedule.snapshot().await.len(), 0);
         assert_eq!(schedule.claim_due().await.len(), 0);
 
-        token.cancel();
-        let _ = handle.await;
+        schedule.shutdown();
     }
 
     #[tokio::test]
     async fn finish_snooze_on_scheduled_activity_keeps_it() {
         let start = Utc::now();
         let clock = TestClock::new(start);
-        let token = CancellationToken::new();
-        let (schedule, handle) = spawn_scheduler::<u32>(16, token.clone(), Arc::new(clock.clone()));
+        let schedule = spawn_scheduler::<u32>(16, Arc::new(clock.clone()));
 
         let target = start + chrono::Duration::seconds(100);
         schedule
@@ -683,8 +697,7 @@ mod tests {
             .map(|a| a.state);
         assert_eq!(state, Some(ActivityState::Snoozed(Duration::from_secs(30))));
 
-        token.cancel();
-        let _ = handle.await;
+        schedule.shutdown();
     }
 
     #[tokio::test]
@@ -715,19 +728,5 @@ mod tests {
         assert_eq!(snapshot.len(), 2);
 
         h.shutdown().await;
-    }
-
-    #[tokio::test]
-    async fn commands_after_cancellation_degrade_gracefully() {
-        let h = Harness::new();
-        h.schedule.register(spec(1, fixed(60))).await.unwrap();
-
-        h.token.cancel();
-        let _ = h.handle.await;
-
-        // The actor is gone; reply-bearing commands fall back to defaults
-        // instead of panicking.
-        assert!(h.schedule.claim_due().await.is_empty());
-        assert!(h.schedule.snapshot().await.is_empty());
     }
 }

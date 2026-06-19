@@ -1,6 +1,9 @@
-use std::{time::Duration};
+use std::time::Duration;
 
-use tokio::{select, task::{JoinHandle, JoinSet}};
+use tokio::{
+    select,
+    task::{JoinError, JoinHandle, JoinSet},
+};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
@@ -9,33 +12,49 @@ use crate::{
     schedule::Scheduler,
 };
 
-pub struct ScheduleDriver<T: ActivityId> {
-    sender: tokio::sync::mpsc::Sender<Ack<T>>,
-    receiver: Option<tokio::sync::mpsc::Receiver<Ack<T>>>,
+#[derive(Debug)]
+pub struct ScheduleDriver {
+    buffer_size: usize,
     poll_interval: Duration,
     cancellation_token: CancellationToken,
+    handle: Option<JoinHandle<()>>,
 }
 
-impl<T: ActivityId> ScheduleDriver<T> {
-
-    pub fn new(buffer_size: usize, poll_interval: Duration, cancellation_token: CancellationToken) -> Self {
-      let (sender, receiver) = tokio::sync::mpsc::channel(buffer_size);
-
-      ScheduleDriver{
-        sender,
-        receiver: Some(receiver),
-        poll_interval,
-        cancellation_token
-      }
+impl ScheduleDriver {
+    pub fn new(buffer_size: usize, poll_interval: Duration) -> Self {
+        ScheduleDriver {
+            buffer_size,
+            poll_interval,
+            cancellation_token: CancellationToken::new(),
+            handle: None,
+        }
     }
 
-    pub fn run(mut self, scheduler: Scheduler<T>) -> (tokio::sync::mpsc::Receiver<Ack<T>>, JoinHandle<()>){
+    pub async fn shutdown(self) -> Result<(), JoinError> {
+        self.cancellation_token.cancel();
+        if let Some(join_handle) = self.handle {
+            join_handle.await
+        } else {
+            Ok(())
+        }
+    }
+
+    pub fn abort(self) {
+        if let Some(join_handle) = self.handle {
+            join_handle.abort();
+        }
+    }
+
+    pub fn run<T: ActivityId>(
+        &mut self,
+        scheduler: Scheduler<T>,
+    ) -> tokio::sync::mpsc::Receiver<Ack<T>> {
+        let (sender, receiver) = tokio::sync::mpsc::channel(self.buffer_size);
         let poll_interval = self.poll_interval;
         let schedule = scheduler.clone();
-        let sender = self.sender.clone();
 
         let mut ticker = tokio::time::interval(poll_interval);
-        let cancellation_token = self.cancellation_token.child_token();
+        let cancellation_token = self.cancellation_token.clone();
 
         let handle = tokio::spawn({
             let cancellation_token = cancellation_token.clone();
@@ -79,6 +98,8 @@ impl<T: ActivityId> ScheduleDriver<T> {
             }
         });
 
-        (self.receiver.take().unwrap(), handle)
+        self.handle = Some(handle);
+
+        receiver
     }
 }

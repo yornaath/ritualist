@@ -1,19 +1,14 @@
 use ritualist::{
-    ack::AckMessage,
-    activity_spec::{ActivitySpec, ActivitySchedule},
     Ritualist,
+    ack::AckMessage,
+    activity_spec::{ActivitySchedule, ActivitySpec},
 };
-use std::{
-    thread::Result,
-    time::Duration,
-};
-use tokio::{
-    sync::{self},
-};
+use std::{thread::Result, time::Duration};
+use tokio::sync::{self};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Copy)]
 pub enum Activity {
-    Ping
+    Ping,
 }
 
 impl Activity {
@@ -39,24 +34,20 @@ impl Activity {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let mut ritualist = Ritualist::new(64, Duration::from_millis(100));
+    let ritualist = Ritualist::new(64, Duration::from_millis(100));
 
     ritualist
-        .register_many(vec![
-            ActivitySpec {
-                id: Activity::Ping,
-                schedule: ActivitySchedule::FixedInterval {
-                    duration: Duration::from_secs(1),
-                },
-            }
-        ])
+        .register_many(vec![ActivitySpec {
+            id: Activity::Ping,
+            schedule: ActivitySchedule::FixedInterval {
+                duration: Duration::from_secs(1),
+            },
+        }])
         .await
         .expect("Could not put activities onto ritualist.");
 
-    let mut channel = ritualist.take_channel();
-    
-    ritualist.run();
-    
+    let mut channel = ritualist.run().take_channel();
+
     let listener = tokio::spawn({
         async move {
             while let Some((activity, ack)) = channel.recv().await {

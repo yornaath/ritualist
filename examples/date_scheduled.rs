@@ -1,6 +1,9 @@
-
 use chrono::{TimeDelta, Utc};
-use ritualist::{Ritualist, ack::AckMessage, activity_spec::{ActivitySchedule, ActivitySpec}};
+use ritualist::{
+    Ritualist,
+    ack::AckMessage,
+    activity_spec::{ActivitySchedule, ActivitySpec},
+};
 use std::{
     io::{self, Write},
     sync::Arc,
@@ -9,7 +12,7 @@ use std::{
 };
 use tokio::{
     sync::{self, Mutex},
-    time::{sleep},
+    time::sleep,
 };
 
 mod common;
@@ -39,7 +42,7 @@ impl Activity {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let mut ritualist = Ritualist::new(64, Duration::from_millis(100));
+    let ritualist = Ritualist::new(64, Duration::from_millis(100));
 
     ritualist
         .register_many(vec![ActivitySpec {
@@ -51,9 +54,9 @@ async fn main() -> Result<()> {
         .await
         .expect("Could not put activities onto ritualist.");
 
-    let mut channel = ritualist.take_channel();
-
-    let ritualist = Arc::new(Mutex::new(ritualist.run()));
+    let mut runner = ritualist.run();
+    let mut channel = runner.take_channel();
+    let ritualist = Arc::new(Mutex::new(runner));
 
     let listener = tokio::spawn({
         async move {

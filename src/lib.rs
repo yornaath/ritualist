@@ -1,20 +1,21 @@
 use crate::{
-    ack::{Ack, AckMessage}, activity::{Activity, ActivityId}, activity_spec::{ActivitySpec, ActivitySpecError}, clock::{Clock, SystemClock}, driver::ScheduleDriver, schedule::{Scheduler, SchedulerError, spawn_scheduler}
+    ack::AckMessage,
+    activity::{Activity, ActivityId},
+    activity_spec::{ActivitySpec, ActivitySpecError},
+    clock::{Clock, SystemClock},
+    driver::ScheduleDriver,
+    schedule::{Scheduler, SchedulerError, spawn_scheduler},
 };
 use std::{ops::Deref, sync::Arc, time::Duration};
-use tokio::{
-    select,
-    sync::{mpsc::Receiver, oneshot::Sender},
-    task::{JoinHandle, JoinSet},
-};
+use tokio::sync::{mpsc::Receiver, oneshot::Sender};
 
 pub mod ack;
 mod activation_target;
 pub mod activity;
 pub mod activity_spec;
 pub mod clock;
-pub mod schedule;
 mod driver;
+pub mod schedule;
 
 /// Ritualist
 ///
@@ -78,10 +79,7 @@ mod driver;
 ///         .expect("invalid activity spec");
 ///
 ///     // Take the receiving end *before* starting the scheduler.
-///     let mut channel = ritualist.take_channel();
-///
-///     // Start the clock
-///     ritualist.run();
+///     let mut channel = ritualist.run().take_channel();
 ///
 ///     // Listen to activities being started
 ///     while let Some((activity, ack)) = channel.recv().await {
@@ -100,12 +98,8 @@ pub struct Ritualist<T>
 where
     T: ActivityId,
 {
-    sender: tokio::sync::mpsc::Sender<Ack<T>>,
-    receiver: Option<tokio::sync::mpsc::Receiver<Ack<T>>>,
-    scheduler: SchedulerHandle<T>,
-    scheduler_handle: JoinHandle<()>,
-    poll_interval: Duration,
-    cancellation_token: tokio_util::sync::CancellationToken,
+    scheduler: SchedulerHandler<T>,
+    driver: ScheduleDriver,
 }
 
 impl<T> Ritualist<T>
@@ -117,91 +111,29 @@ where
     }
 
     pub fn with_clock(
-        buffer: usize,
+        buffer_size: usize,
         poll_interval: Duration,
         clock: Arc<dyn Clock>,
     ) -> Ritualist<T> {
-        let (sender, receiver) = tokio::sync::mpsc::channel(buffer);
-
-        let cancellation_token = tokio_util::sync::CancellationToken::new();
-        let (scheduler, scheduler_handle) =
-            spawn_scheduler(buffer, cancellation_token.clone(), clock);
+        let scheduler = spawn_scheduler(buffer_size, clock);
+        let driver = ScheduleDriver::new(buffer_size, poll_interval);
 
         let ritualist: Ritualist<T> = Ritualist {
-            sender,
-            receiver: Some(receiver),
-            scheduler: SchedulerHandle { scheduler },
-            scheduler_handle: scheduler_handle,
-            poll_interval,
-            cancellation_token: cancellation_token,
+            scheduler: SchedulerHandler { scheduler },
+            driver: driver,
         };
 
         ritualist
     }
 
-    pub fn take_channel(&mut self) -> Receiver<(T, Sender<AckMessage>)> {
-        self.receiver.take().unwrap()
-    }
-
-    pub fn run(self) -> RunningRitualist<T> {
-        let poll_interval = self.poll_interval;
+    pub fn run(mut self) -> RunningRitualist<T> {
         let schedule = self.scheduler.scheduler.clone();
-        let sender = self.sender.clone();
-
-        let mut ticker = tokio::time::interval(poll_interval);
-        let cancellation_token = self.cancellation_token.clone();
-        let poll_token = self.cancellation_token.child_token();
-
-        let a = ScheduleDriver::new(buffer_size, poll_interval, cancellation_token)
-
-        let handle = tokio::spawn({
-            let poll_token = poll_token.clone();
-            async move {
-                let mut dispatch = JoinSet::<()>::new();
-
-                loop {
-                    select! {
-                        _ = poll_token.cancelled() => break,
-                        _ = ticker.tick() => {
-                            schedule.tick().await;
-
-                            let due = schedule.claim_due().await;
-
-                            for id in due {
-                                let sender = sender.clone();
-                                let schedule = schedule.clone();
-
-                                dispatch.spawn(async move {
-                                    let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
-
-                                    let _ = sender.send((id, ack_tx)).await;
-                                    let outcome = ack_rx.await.unwrap_or(AckMessage::Done);
-
-                                    schedule.finish(id, outcome).await;
-                                });
-                            }
-                        },
-                        Some(_) = dispatch.join_next() => {}
-                    }
-                }
-
-                let _ = tokio::time::timeout(Duration::from_secs(5), async {
-                    while dispatch.join_next().await.is_some() {}
-                })
-                .await;
-
-                dispatch.abort_all();
-
-                while dispatch.join_next().await.is_some() {}
-            }
-        });
+        let receiver = self.driver.run(schedule);
 
         RunningRitualist {
+            receiver: Some(receiver),
             scheduler: self.scheduler,
-            scheduler_handle: self.scheduler_handle,
-            polling_handle: handle,
-            cancellation_token: cancellation_token,
-            poll_token: poll_token.clone(),
+            driver: self.driver,
         }
     }
 }
@@ -210,7 +142,7 @@ impl<T> Deref for Ritualist<T>
 where
     T: ActivityId,
 {
-    type Target = SchedulerHandle<T>;
+    type Target = SchedulerHandler<T>;
 
     fn deref(&self) -> &Self::Target {
         &self.scheduler
@@ -222,34 +154,27 @@ pub struct RunningRitualist<T>
 where
     T: ActivityId,
 {
-    scheduler: SchedulerHandle<T>,
-    polling_handle: JoinHandle<()>,
-    scheduler_handle: JoinHandle<()>,
-    poll_token: tokio_util::sync::CancellationToken,
-    cancellation_token: tokio_util::sync::CancellationToken,
+    receiver: Option<Receiver<(T, Sender<AckMessage>)>>,
+    scheduler: SchedulerHandler<T>,
+    driver: ScheduleDriver,
 }
 impl<T> RunningRitualist<T>
 where
     T: ActivityId,
 {
-    pub fn handle(&self) -> &JoinHandle<()> {
-        &self.polling_handle
-    }
-
-    pub async fn join(self) -> Result<(), tokio::task::JoinError> {
-        self.polling_handle.await
+    pub fn take_channel(&mut self) -> Receiver<(T, Sender<AckMessage>)> {
+        self.receiver.take().unwrap()
     }
 
     pub async fn shutdown(self) -> Result<(), tokio::task::JoinError> {
-        self.poll_token.cancel();
-        self.polling_handle.await?;
-        self.cancellation_token.cancel();
-        self.scheduler_handle.await
+        self.driver.shutdown().await?;
+        self.scheduler.scheduler.shutdown().await?;
+        Ok(())
     }
 
     pub async fn abort(self) {
-        self.polling_handle.abort();
-        self.scheduler_handle.abort();
+        self.driver.abort();
+        self.scheduler.scheduler.abort();
     }
 }
 
@@ -257,26 +182,26 @@ impl<T> Deref for RunningRitualist<T>
 where
     T: ActivityId,
 {
-    type Target = SchedulerHandle<T>;
+    type Target = SchedulerHandler<T>;
 
     fn deref(&self) -> &Self::Target {
         &self.scheduler
     }
 }
 
-/// Scheduler handle trait
+/// Scheduler handler
 ///
 /// Shared logic for scheduling methods like regsiter, set_enabled and snapshot
 /// that is shared between the [`Ritualist`] and the [`RunningRitualist`]
 #[derive(Debug, Clone)]
-pub struct SchedulerHandle<T>
+pub struct SchedulerHandler<T>
 where
     T: ActivityId,
 {
     scheduler: Scheduler<T>,
 }
 
-impl<T> SchedulerHandle<T>
+impl<T> SchedulerHandler<T>
 where
     T: ActivityId,
 {
