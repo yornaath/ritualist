@@ -1,9 +1,10 @@
 use ritualist::{
-    Ritualist, WithScheduler,
+    Ritualist,
     ack::AckMessage,
     activity_spec::{ActivitySchedule, ActivitySpec},
+    schedule::WithScheduler,
 };
-use std::{sync::Arc, thread::Result, time::Duration};
+use std::{thread::Result, time::Duration};
 use tokio::{
     sync::{self},
     time::sleep,

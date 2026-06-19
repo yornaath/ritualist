@@ -1,8 +1,9 @@
 use chrono::{TimeDelta, Utc};
 use ritualist::{
-    Ritualist, WithScheduler,
+    Ritualist,
     ack::AckMessage,
     activity_spec::{ActivitySchedule, ActivitySpec},
+    schedule::WithScheduler,
 };
 use std::{
     io::{self, Write},

@@ -1,12 +1,11 @@
 use crate::{
     ack::AckMessage,
-    activity::{Activity, ActivityId},
-    activity_spec::{ActivitySpec, ActivitySpecError},
+    activity::ActivityId,
     clock::{Clock, SystemClock},
     driver::ScheduleDriver,
-    schedule::{Scheduler, SchedulerError, spawn_scheduler},
+    schedule::{Scheduler, WithScheduler, spawn_scheduler},
 };
-use std::{ops::Deref, sync::Arc, time::Duration};
+use std::{sync::Arc, time::Duration};
 use tokio::sync::{mpsc::Receiver, oneshot::Sender};
 
 pub mod ack;
@@ -15,6 +14,7 @@ pub mod activity;
 pub mod activity_spec;
 pub mod clock;
 mod driver;
+pub mod error;
 pub mod schedule;
 
 /// Ritualist
@@ -29,9 +29,9 @@ pub mod schedule;
 /// ```no_run
 /// use ritualist::{
 ///     Ritualist,
-///     WithScheduler,
 ///     ack::AckMessage,
 ///     activity_spec::{ActivitySchedule, ActivitySpec},
+///     schedule::WithScheduler
 /// };
 /// use std::time::Duration;
 /// use tokio::sync;
@@ -175,88 +175,4 @@ impl<T: ActivityId> WithScheduler<T> for RunningRitualist<T> {
     fn get_scheduler(&self) -> Scheduler<T> {
         self.scheduler.clone()
     }
-}
-
-pub trait WithScheduler<T>
-where
-    T: ActivityId,
-{
-    fn get_scheduler(&self) -> Scheduler<T>;
-    /// Schedules a new activity to run at the given interval.
-    ///
-    /// Hash of T: [`activity::ActivityId`] is treated as the activities unique identifier
-    /// and will be used when storing the activity in the scheduler.
-    ///
-    /// Will return an error if the activity is already registered.
-    async fn register(&self, spec: ActivitySpec<T>) -> Result<(), RitualistError> {
-        spec.validate().map_err(RitualistError::ActivitySpecError)?;
-
-        self.get_scheduler()
-            .register(spec)
-            .await
-            .map_err(RitualistError::ScheulerError)?;
-
-        Ok(())
-    }
-
-    /// Same as register but for a batch.
-    /// Ref [`SchedulerHandle::register`]
-    async fn register_many(&self, specs: Vec<ActivitySpec<T>>) -> Result<(), RitualistError> {
-        for spec in &specs {
-            spec.validate().map_err(RitualistError::ActivitySpecError)?;
-        }
-
-        self.get_scheduler()
-            .register_many(specs)
-            .await
-            .map_err(RitualistError::ScheulerError)?;
-
-        Ok(())
-    }
-
-    /// Reset a activitiy.
-    ///
-    /// Same as [`SchedulerHandle::resger`] but will overwrite and reschedule
-    /// the given activitiy.
-    async fn reset(&self, spec: ActivitySpec<T>) -> Result<(), RitualistError> {
-        spec.validate().map_err(RitualistError::ActivitySpecError)?;
-        self.get_scheduler().reset(spec).await;
-        Ok(())
-    }
-
-    /// Reset a set of activities.
-    ///
-    /// Same as [`SchedulerHandle::register_many`] but will overwrite and reschedule
-    /// the given activities.
-    async fn reset_many(&self, specs: Vec<ActivitySpec<T>>) -> Result<(), RitualistError> {
-        for spec in &specs {
-            spec.validate().map_err(RitualistError::ActivitySpecError)?;
-        }
-        self.get_scheduler().reset_many(specs).await;
-        Ok(())
-    }
-
-    /// Enable or disable a given task.
-    ///
-    /// - For interval scheduled tasks this will pause the timer.
-    /// - For date scheduled tasks this will omit emitting the activity event
-    ///   if the activity is disabled when it should have fired.
-    async fn set_enabled(&self, id: T, enabled: bool) {
-        self.get_scheduler().set_enabled(id, enabled).await;
-    }
-
-    /// Get a snapshot of the activities and their states currently in the scheduler
-    /// The activities are cloned and mutating them wont affect the scheduler state.
-    async fn snapshot(&self) -> Vec<Activity<T>> {
-        self.get_scheduler().snapshot().await
-    }
-}
-
-#[derive(Debug, thiserror::Error)]
-#[non_exhaustive]
-pub enum RitualistError {
-    #[error("An error with the validation of the ActivitySpec.")]
-    ActivitySpecError(ActivitySpecError),
-    #[error("An error happend in the scheulder.")]
-    ScheulerError(SchedulerError),
 }
