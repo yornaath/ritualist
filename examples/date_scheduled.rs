@@ -56,6 +56,7 @@ async fn main() -> Result<()> {
 
     let mut runner = ritualist.run();
     let mut channel = runner.take_channel();
+
     let ritualist = Arc::new(Mutex::new(runner));
 
     let listener = tokio::spawn({
