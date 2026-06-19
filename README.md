@@ -98,7 +98,7 @@ impl Activity {
 #[tokio::main]
 async fn main() {
     // buffer = channel capacity, poll_interval = how often the scheduler ticks.
-    let mut ritualist = Ritualist::new(64, Duration::from_millis(100));
+    let mut ritualist = Ritualist::builder().build();
 
     ritualist
         .register_many(vec![
@@ -210,7 +210,7 @@ Disabling preserves the activity's previous state, so re-enabling resumes
 exactly where it left off. It's idempotent — disabling twice won't nest.
 
 ```rust
-let running = ritualist.run();
+let (running, channel) = ritualist.run();
 
 // ... later, from any task holding the handle:
 running.set_enabled(Activity::Ping, false).await; // pause
@@ -240,11 +240,14 @@ for activity in running.snapshot().await {
 
 ## Registering after start
 
-Both `Ritualist` and `RunningRitualist` expose `register` and `register_many`,
-so you can add activities before or after calling `run()`.
+Both `Ritualist` and `RunningRitualist` deref to a shared `RitualistHandle`,
+which exposes `register`, `register_many`, `set_enabled`, and `snapshot`, so you
+can add activities before or after calling `run()`. The handle is cheap to clone,
+so you can hand one out and register activities concurrently while the ritualist
+is running.
 
 ```rust
-let running = ritualist.run();
+let (running, channel) = ritualist.run();
 
 running
     .register(ActivitySpec {
@@ -264,7 +267,7 @@ period), then stops the scheduler. Use `abort()` to stop immediately without
 draining, or `join()` to wait for the polling task to finish on its own.
 
 ```rust
-let running = ritualist.run();
+let (running, channel) = ritualist.run();
 // ... run for a while ...
 running.shutdown().await.expect("clean shutdown");
 ```

@@ -1,38 +1,37 @@
 use crate::{
-    ack::{Ack, AckMessage},
-    activity::{Activity, ActivityId},
-    activity_spec::{ActivitySpec, ActivitySpecError},
+    ack::AckMessage,
+    activity::ActivityId,
     clock::{Clock, SystemClock},
-    schedule::{Schedule, spawn_scheduler},
+    driver::ScheduleDriver,
+    schedule::{Scheduler, WithScheduler, spawn_scheduler},
 };
-use std::{fmt::Debug, hash::Hash, sync::Arc, time::Duration};
-use tokio::{
-    select,
-    sync::{mpsc::Receiver, oneshot::Sender},
-    task::{JoinHandle, JoinSet},
-};
+use std::{marker::PhantomData, sync::Arc, time::Duration};
+use tokio::sync::{mpsc::Receiver, oneshot::Sender};
 
 pub mod ack;
 mod activation_target;
 pub mod activity;
 pub mod activity_spec;
 pub mod clock;
+mod driver;
+pub mod error;
 pub mod schedule;
 
 /// Ritualist
-/// 
+///
 /// The ritualist is the activity orchestrator where you can register activites to run at certain intervals
 /// or at given dates. For now there is no persistence and it is meant to be run in the background of native apps
 /// where the app wants to schedule reminders etc at given intervals.
-/// 
+///
 /// This is a main module for the [https://www.glimtapp.io] now open sourced.
-/// 
+///
 /// Example:
 /// ```no_run
 /// use ritualist::{
 ///     Ritualist,
 ///     ack::AckMessage,
 ///     activity_spec::{ActivitySchedule, ActivitySpec},
+///     schedule::WithScheduler
 /// };
 /// use std::time::Duration;
 /// use tokio::sync;
@@ -60,7 +59,7 @@ pub mod schedule;
 /// #[tokio::main]
 /// async fn main() {
 ///     // buffer = channel capacity, poll_interval = how often the scheduler ticks.
-///     let mut ritualist = Ritualist::new(64, Duration::from_millis(100));
+///     let mut ritualist = Ritualist::builder().build();
 ///
 ///     ritualist
 ///         .register_many(vec![
@@ -80,11 +79,8 @@ pub mod schedule;
 ///         .await
 ///         .expect("invalid activity spec");
 ///
-///     // Take the receiving end *before* starting the scheduler.
-///     let mut channel = ritualist.take_channel();
-///
-///     // Start the clock
-///     ritualist.run();
+///     // Start the ritualist, returning a running ritualist and the activity channel
+///     let (_, mut channel) = ritualist.run();
 ///
 ///     // Listen to activities being started
 ///     while let Some((activity, ack)) = channel.recv().await {
@@ -92,141 +88,109 @@ pub mod schedule;
 ///     }
 /// }
 /// ```
+/// A cheap-to-clone handle for the state-independent operations on a ritualist.
+///
+/// Both [`Ritualist`] and [`RunningRitualist`] deref to this, so the shared
+/// operations (register, enable, snapshot) are defined exactly once. The handle
+/// is `Clone`, so it can be handed out and used to mutate the schedule
+/// concurrently, including while the ritualist is running.
 #[derive(Debug)]
 pub struct Ritualist<T>
 where
     T: ActivityId,
 {
-    sender: tokio::sync::mpsc::Sender<Ack<T>>,
-    receiver: Option<tokio::sync::mpsc::Receiver<Ack<T>>>,
-    scheduler: Schedule<T>,
-    scheduler_handle: JoinHandle<()>,
-    poll_interval: Duration,
-    cancellation_token: tokio_util::sync::CancellationToken,
+    scheduler: Scheduler<T>,
+    driver: ScheduleDriver,
 }
 
 impl<T> Ritualist<T>
 where
     T: ActivityId,
 {
-    pub fn new(buffer: usize, poll_interval: Duration) -> Ritualist<T> {
-        Self::with_clock(buffer, poll_interval, Arc::new(SystemClock))
+    pub fn builder() -> RitualistBuilder<T> {
+        RitualistBuilder::new()
     }
 
-    pub fn with_clock(
-        buffer: usize,
-        poll_interval: Duration,
-        clock: Arc<dyn Clock>,
-    ) -> Ritualist<T> {
-        let (sender, receiver) = tokio::sync::mpsc::channel(buffer);
+    /// Create a new ritualist instance.
+    /// However the builder() pattern is preffered.
+    pub fn new(buffer_size: usize, poll_interval: Duration, clock: Arc<dyn Clock>) -> Ritualist<T> {
+        let scheduler = spawn_scheduler(buffer_size, clock);
+        let driver = ScheduleDriver::new(buffer_size, poll_interval);
 
-        let cancellation_token = tokio_util::sync::CancellationToken::new();
-        let (scheduler, scheduler_handle) =
-            spawn_scheduler(buffer, cancellation_token.clone(), clock);
-
-        let ritualist: Ritualist<T> = Ritualist {
-            sender,
-            receiver: Some(receiver),
-            scheduler: scheduler,
-            scheduler_handle: scheduler_handle,
-            poll_interval,
-            cancellation_token: cancellation_token,
-        };
+        let ritualist: Ritualist<T> = Ritualist { scheduler, driver };
 
         ritualist
     }
 
-    pub async fn register(&self, spec: ActivitySpec<T>) -> Result<(), ActivitySpecError> {
-        spec.validate()?;
-        self.scheduler.register(spec).await;
-        Ok(())
-    }
-
-    pub async fn register_many(
-        &self,
-        specs: Vec<ActivitySpec<T>>,
-    ) -> Result<(), Vec<ActivitySpecError>> {
-        let errors: Vec<ActivitySpecError> = specs
-            .iter()
-            .filter_map(|s| {
-                if let Err(error) = s.validate() {
-                    return Some(error);
-                }
-                None
-            })
-            .collect();
-
-        if !errors.is_empty() {
-            return Err(errors);
-        }
-
-        self.scheduler.register_many(specs).await;
-
-        Ok(())
-    }
-
-    pub fn take_channel(&mut self) -> Receiver<(T, Sender<AckMessage>)> {
-        self.receiver.take().unwrap()
-    }
-
-    pub fn run(self) -> RunningRitualist<T> {
-        let poll_interval = self.poll_interval;
+    /// Start the scheduler - all registered activities will start emitting.
+    ///
+    /// Consumes self and [`crate::RunningRitualist`]
+    /// Typesafe pattern Where Ritualist::run() -> RunningRitualist that cannot be run again.
+    pub fn run(mut self) -> (RunningRitualist<T>, Receiver<(T, Sender<AckMessage>)>) {
         let schedule = self.scheduler.clone();
-        let sender = self.sender.clone();
+        let receiver = self.driver.run(schedule);
 
-        let mut ticker = tokio::time::interval(poll_interval);
-        let cancellation_token = self.cancellation_token.clone();
-        let poll_token = self.cancellation_token.child_token();
+        (
+            RunningRitualist {
+                scheduler: self.scheduler,
+                driver: self.driver,
+            },
+            receiver,
+        )
+    }
+}
 
-        let handle = tokio::spawn({
-            let poll_token = poll_token.clone();
-            async move {
-                let mut dispatch = JoinSet::<()>::new();
+impl<T: ActivityId> WithScheduler<T> for Ritualist<T> {
+    fn get_scheduler(&self) -> Scheduler<T> {
+        self.scheduler.clone()
+    }
+}
 
-                loop {
-                    select! {
-                        _ = poll_token.cancelled() => break,
-                        _ = ticker.tick() => {
-                            schedule.tick().await;
+#[derive(Debug, Clone)]
+pub struct RitualistBuilder<T: ActivityId> {
+    buffer_size: usize,
+    poll_interval: Duration,
+    clock: Arc<dyn Clock>,
+    _state: PhantomData<T>,
+}
 
-                            let due = schedule.claim_due().await;
-
-                            for id in due {
-                                let sender = sender.clone();
-                                let schedule = schedule.clone();
-
-                                dispatch.spawn(async move {
-                                    let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
-
-                                    let _ = sender.send((id, ack_tx)).await;
-                                    let outcome = ack_rx.await.unwrap_or(AckMessage::Done);
-
-                                    schedule.finish(id, outcome).await;
-                                });
-                            }
-                        },
-                        Some(_) = dispatch.join_next() => {}
-                    }
-                }
-
-                let _ = tokio::time::timeout(Duration::from_secs(5), async {
-                    while dispatch.join_next().await.is_some() {}
-                })
-                .await;
-
-                dispatch.abort_all();
-
-                while dispatch.join_next().await.is_some() {}
-            }
-        });
-
-        RunningRitualist {
-            schedule: self.scheduler.clone(),
-            scheduler_handle: self.scheduler_handle,
-            polling_handle: handle,
-            cancellation_token: cancellation_token,
-            poll_token: poll_token.clone(),
+impl<T: ActivityId> RitualistBuilder<T> {
+    pub fn new() -> RitualistBuilder<T> {
+        RitualistBuilder::<T> {
+            buffer_size: 256,
+            poll_interval: Duration::from_millis(500),
+            clock: Arc::new(SystemClock),
+            _state: PhantomData,
         }
+    }
+
+    /// The capacity of the channels used to deliver due activities and
+    /// internal scheduler messages. A larger buffer lets more activities
+    /// queue up before back-pressure kicks in, at the cost of memory.
+    /// Set this higher if you schedule many activities that may fire in the
+    /// same tick. Defaults to 256.
+    pub fn buffer_size(mut self, buffer_size: usize) -> Self {
+        self.buffer_size = buffer_size;
+        self.clone()
+    }
+
+    /// How often the scheduler will check for due activities to run.
+    /// Defaults to 500ms, meaning no [`Activity`] can run more often than this.
+    pub fn poll_interval(mut self, interval: Duration) -> Self {
+        self.poll_interval = interval;
+        self.clone()
+    }
+
+    /// Set the clock for the scheduler, impl [`Clock`]
+    /// Mostly handy for testing.
+    pub fn clock(mut self, clock: Arc<dyn Clock>) -> Self {
+        self.clock = clock;
+        self.clone()
+    }
+
+    /// Consume the builder and create a Ritualist instance.
+    pub fn build(self) -> Ritualist<T> {
+        Ritualist::new(self.buffer_size, self.poll_interval, self.clock)
     }
 }
 
@@ -235,70 +199,31 @@ pub struct RunningRitualist<T>
 where
     T: ActivityId,
 {
-    schedule: Schedule<T>,
-    polling_handle: JoinHandle<()>,
-    scheduler_handle: JoinHandle<()>,
-    poll_token: tokio_util::sync::CancellationToken,
-    cancellation_token: tokio_util::sync::CancellationToken,
+    scheduler: Scheduler<T>,
+    driver: ScheduleDriver,
 }
 impl<T> RunningRitualist<T>
 where
-    T: Debug + PartialEq + Eq + Hash + Send + Copy + 'static,
+    T: ActivityId,
 {
-    pub async fn register(&self, spec: ActivitySpec<T>) -> Result<(), ActivitySpecError> {
-        spec.validate()?;
-        self.schedule.register(spec).await;
-        Ok(())
-    }
-
-    pub async fn register_many(
-        &mut self,
-        specs: Vec<ActivitySpec<T>>,
-    ) -> Result<(), Vec<ActivitySpecError>> {
-        let errors: Vec<ActivitySpecError> = specs
-            .iter()
-            .filter_map(|s| {
-                if let Err(error) = s.validate() {
-                    return Some(error);
-                }
-                None
-            })
-            .collect();
-
-        if !errors.is_empty() {
-            return Err(errors);
-        }
-
-        self.schedule.register_many(specs).await;
-
-        Ok(())
-    }
-
-    pub async fn set_enabled(&self, id: T, enabled: bool) {
-        self.schedule.set_enabled(id, enabled).await;
-    }
-
-    pub fn handle(&self) -> &JoinHandle<()> {
-        &self.polling_handle
-    }
-
-    pub async fn join(self) -> Result<(), tokio::task::JoinError> {
-        self.polling_handle.await
-    }
-
-    pub async fn snapshot(&self) -> Vec<Activity<T>> {
-        self.schedule.snapshot().await
-    }
-
+    /// Gracefully shut down the driver and scheduler.
+    /// Leaves som room for running tasks to finish.
     pub async fn shutdown(self) -> Result<(), tokio::task::JoinError> {
-        self.poll_token.cancel();
-        self.polling_handle.await?;
-        self.cancellation_token.cancel();
-        self.scheduler_handle.await
+        self.driver.shutdown().await?;
+        self.scheduler.shutdown().await?;
+        Ok(())
     }
 
+    /// Hard abort both driver and scheduler.
+    /// Will not leave room for activity tasks to finish.
     pub async fn abort(self) {
-        self.polling_handle.abort();
-        self.scheduler_handle.abort();
+        self.driver.abort();
+        self.scheduler.abort();
+    }
+}
+
+impl<T: ActivityId> WithScheduler<T> for RunningRitualist<T> {
+    fn get_scheduler(&self) -> Scheduler<T> {
+        self.scheduler.clone()
     }
 }

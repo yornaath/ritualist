@@ -3,8 +3,13 @@ use crate::{
     activity::{Activity, ActivityId, ActivityState},
     activity_spec::ActivitySpec,
     clock::Clock,
+    error::RitualistError,
 };
-use std::{collections::HashMap, fmt::Debug, sync::Arc};
+use std::{
+    collections::HashMap,
+    fmt::Debug,
+    sync::{Arc, Mutex},
+};
 use tokio::{
     select,
     sync::{
@@ -13,11 +18,24 @@ use tokio::{
     },
     task::JoinHandle,
 };
+use tokio_util::sync::CancellationToken;
 
 #[derive(Debug)]
 enum Command<T: ActivityId> {
-    Register(ActivitySpec<T>),
-    RegisterMany(Vec<ActivitySpec<T>>),
+    Register {
+        spec: ActivitySpec<T>,
+        reply: oneshot::Sender<Result<(), SchedulerError>>,
+    },
+    RegisterMany {
+        specs: Vec<ActivitySpec<T>>,
+        reply: oneshot::Sender<Result<(), SchedulerError>>,
+    },
+    Reset {
+        spec: ActivitySpec<T>,
+    },
+    ResetMany {
+        specs: Vec<ActivitySpec<T>>,
+    },
     Tick,
     SetEnabled {
         id: T,
@@ -36,55 +54,101 @@ enum Command<T: ActivityId> {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct Schedule<T>
+pub struct Scheduler<T>
 where
     T: ActivityId,
 {
-    tx: mpsc::Sender<Command<T>>,
+    actor_tx: mpsc::Sender<Command<T>>,
+    cancellation_token: CancellationToken,
+    handle: Arc<Mutex<Option<JoinHandle<()>>>>,
 }
 
-impl<T> Schedule<T>
+impl<T> Scheduler<T>
 where
     T: ActivityId,
 {
-    pub async fn register(&self, spec: ActivitySpec<T>) {
-        let _ = self.tx.send(Command::Register(spec)).await;
+    pub async fn register(&self, spec: ActivitySpec<T>) -> Result<(), SchedulerError> {
+        let (reply, rx) = oneshot::channel();
+        let _ = self.actor_tx.send(Command::Register { spec, reply }).await;
+        rx.await.unwrap()
     }
 
-    pub async fn register_many(&self, specs: Vec<ActivitySpec<T>>) {
-        let _ = self.tx.send(Command::RegisterMany(specs)).await;
+    pub async fn register_many(&self, specs: Vec<ActivitySpec<T>>) -> Result<(), SchedulerError> {
+        let (reply, rx) = oneshot::channel();
+        let _ = self
+            .actor_tx
+            .send(Command::RegisterMany { specs, reply })
+            .await;
+        rx.await.unwrap()
+    }
+
+    pub async fn reset(&self, spec: ActivitySpec<T>) {
+        let _ = self.actor_tx.send(Command::Reset { spec }).await;
+    }
+
+    pub async fn reset_many(&self, specs: Vec<ActivitySpec<T>>) {
+        let _ = self.actor_tx.send(Command::ResetMany { specs }).await;
     }
 
     pub async fn tick(&self) {
-        let _ = self.tx.send(Command::Tick).await;
+        let _ = self.actor_tx.send(Command::Tick).await;
     }
 
     pub async fn set_enabled(&self, id: T, enabled: bool) {
-        let _ = self.tx.send(Command::SetEnabled { id, enabled }).await;
+        let _ = self
+            .actor_tx
+            .send(Command::SetEnabled { id, enabled })
+            .await;
     }
 
     pub async fn claim_due(&self) -> Vec<T> {
         let (reply, rx) = oneshot::channel();
-        if self.tx.send(Command::ClaimDue { reply }).await.is_err() {
+        if self
+            .actor_tx
+            .send(Command::ClaimDue { reply })
+            .await
+            .is_err()
+        {
             return Vec::new();
         }
         rx.await.unwrap_or_default()
     }
 
     pub async fn finish(&self, id: T, ack: AckMessage) {
-        let _ = self.tx.send(Command::Finish { id, ack }).await;
+        let _ = self.actor_tx.send(Command::Finish { id, ack }).await;
     }
 
     pub async fn snapshot(&self) -> Vec<Activity<T>> {
         let (reply, rx) = oneshot::channel();
-        if self.tx.send(Command::Snapshot { reply }).await.is_err() {
+        if self
+            .actor_tx
+            .send(Command::Snapshot { reply })
+            .await
+            .is_err()
+        {
             return Vec::new();
         }
         rx.await.unwrap_or_default()
     }
+
+    pub async fn shutdown(self) -> Result<(), tokio::task::JoinError> {
+        self.cancellation_token.cancel();
+        let handle = self.handle.lock().unwrap().take();
+        if let Some(handle) = handle {
+            handle.await?
+        }
+        Ok(())
+    }
+
+    pub fn abort(self) {
+        let handle = self.handle.lock().unwrap().take();
+        if let Some(handle) = handle {
+            handle.abort();
+        }
+    }
 }
 
-struct ScheduleActor<T>
+struct SchedulerActor<T>
 where
     T: ActivityId,
 {
@@ -92,18 +156,43 @@ where
     clock: Arc<dyn Clock>,
 }
 
-impl<T> ScheduleActor<T>
+impl<T> SchedulerActor<T>
 where
     T: ActivityId,
 {
     fn send(&mut self, cmd: Command<T>) {
         match cmd {
-            Command::Register(spec) => {
+            Command::Register { spec, reply } => {
+                if self.activities.contains_key(&spec.id) {
+                    let _ = reply.send(Err(SchedulerError::ActivityAlreadyRegistered));
+                } else {
+                    self.activities
+                        .insert(spec.id, Activity::new(spec, self.clock.clone()));
+
+                    let _ = reply.send(Ok(()));
+                }
+            }
+
+            Command::RegisterMany { specs, reply } => {
+                for spec in specs {
+                    if self.activities.contains_key(&spec.id) {
+                        let _ = reply.send(Err(SchedulerError::ActivityAlreadyRegistered));
+                        return;
+                    }
+
+                    self.activities
+                        .insert(spec.id, Activity::new(spec, self.clock.clone()));
+                }
+
+                let _ = reply.send(Ok(()));
+            }
+
+            Command::Reset { spec } => {
                 self.activities
                     .insert(spec.id, Activity::new(spec, self.clock.clone()));
             }
 
-            Command::RegisterMany(specs) => {
+            Command::ResetMany { specs } => {
                 for spec in specs {
                     self.activities
                         .insert(spec.id, Activity::new(spec, self.clock.clone()));
@@ -111,9 +200,10 @@ where
             }
 
             Command::Tick => {
-                for activity in self.activities.values_mut() {
+                self.activities.retain(|_id, activity| {
                     activity.tick();
-                }
+                    activity.state != ActivityState::Gc
+                });
             }
 
             Command::SetEnabled { id, enabled } => {
@@ -148,32 +238,571 @@ where
     }
 }
 
-pub(crate) fn spawn_scheduler<T>(
-    buffer: usize,
-    cancellation_token: tokio_util::sync::CancellationToken,
-    clock: Arc<dyn Clock>,
-) -> (Schedule<T>, JoinHandle<()>)
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum SchedulerError {
+    #[error("this activity has been registered, maybe you want reset()")]
+    ActivityAlreadyRegistered,
+}
+
+pub(crate) fn spawn_scheduler<T>(buffer: usize, clock: Arc<dyn Clock>) -> Scheduler<T>
 where
     T: ActivityId,
 {
-    let (tx, mut rx) = mpsc::channel::<Command<T>>(buffer);
+    let (actor_tx, mut rx) = mpsc::channel::<Command<T>>(buffer);
+    let cancellation_token = tokio_util::sync::CancellationToken::new();
 
-    let handle = tokio::spawn(async move {
-        let mut actor = ScheduleActor {
-            activities: HashMap::new(),
-            clock: clock,
-        };
+    let handle = tokio::spawn({
+        let cancellation_token = cancellation_token.clone();
+        async move {
+            let mut actor = SchedulerActor {
+                activities: HashMap::new(),
+                clock,
+            };
 
-        loop {
-            select! {
-                _ = cancellation_token.cancelled() => break,
-                message = rx.recv() => match message {
-                    Some(cmd) => actor.send(cmd),
-                    None => break
+            loop {
+                select! {
+                    _ = cancellation_token.cancelled() => break,
+                    message = rx.recv() => match message {
+                        Some(cmd) => actor.send(cmd),
+                        None => break
+                    }
                 }
             }
         }
     });
 
-    (Schedule { tx }, handle)
+    Scheduler {
+        actor_tx,
+        cancellation_token,
+        handle: Arc::new(Mutex::new(Some(handle))),
+    }
+}
+
+pub trait WithScheduler<T>
+where
+    T: ActivityId,
+{
+    fn get_scheduler(&self) -> Scheduler<T>;
+    /// Schedules a new activity to run at the given interval.
+    ///
+    /// Hash of T: [`activity::ActivityId`] is treated as the activities unique identifier
+    /// and will be used when storing the activity in the scheduler.
+    ///
+    /// Will return an error if the activity is already registered.
+    async fn register(&self, spec: ActivitySpec<T>) -> Result<(), RitualistError> {
+        spec.validate().map_err(RitualistError::ActivitySpecError)?;
+
+        self.get_scheduler()
+            .register(spec)
+            .await
+            .map_err(RitualistError::ScheulerError)?;
+
+        Ok(())
+    }
+
+    /// Same as register but for a batch.
+    /// Ref [`SchedulerHandle::register`]
+    async fn register_many(&self, specs: Vec<ActivitySpec<T>>) -> Result<(), RitualistError> {
+        for spec in &specs {
+            spec.validate().map_err(RitualistError::ActivitySpecError)?;
+        }
+
+        self.get_scheduler()
+            .register_many(specs)
+            .await
+            .map_err(RitualistError::ScheulerError)?;
+
+        Ok(())
+    }
+
+    /// Reset a activitiy.
+    ///
+    /// Same as [`SchedulerHandle::resger`] but will overwrite and reschedule
+    /// the given activitiy.
+    async fn reset(&self, spec: ActivitySpec<T>) -> Result<(), RitualistError> {
+        spec.validate().map_err(RitualistError::ActivitySpecError)?;
+        self.get_scheduler().reset(spec).await;
+        Ok(())
+    }
+
+    /// Reset a set of activities.
+    ///
+    /// Same as [`SchedulerHandle::register_many`] but will overwrite and reschedule
+    /// the given activities.
+    async fn reset_many(&self, specs: Vec<ActivitySpec<T>>) -> Result<(), RitualistError> {
+        for spec in &specs {
+            spec.validate().map_err(RitualistError::ActivitySpecError)?;
+        }
+        self.get_scheduler().reset_many(specs).await;
+        Ok(())
+    }
+
+    /// Enable or disable a given task.
+    ///
+    /// - For interval scheduled tasks this will pause the timer.
+    /// - For date scheduled tasks this will omit emitting the activity event
+    ///   if the activity is disabled when it should have fired.
+    async fn set_enabled(&self, id: T, enabled: bool) {
+        self.get_scheduler().set_enabled(id, enabled).await;
+    }
+
+    /// Get a snapshot of the activities and their states currently in the scheduler
+    /// The activities are cloned and mutating them wont affect the scheduler state.
+    async fn snapshot(&self) -> Vec<Activity<T>> {
+        self.get_scheduler().snapshot().await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        ack::AckMessage,
+        activity::ActivityState,
+        activity_spec::{ActivitySchedule, ActivitySpec},
+        clock::TestClock,
+    };
+    use chrono::Utc;
+    use std::time::Duration;
+    use tokio_util::sync::CancellationToken;
+
+    fn fixed(secs: u64) -> ActivitySchedule {
+        ActivitySchedule::FixedInterval {
+            duration: Duration::from_secs(secs),
+        }
+    }
+
+    fn spec(id: u32, schedule: ActivitySchedule) -> ActivitySpec<u32> {
+        ActivitySpec { id, schedule }
+    }
+
+    /// A test harness owning the spawned scheduler actor, its handle to send
+    /// commands, and the [`TestClock`] driving it. Time only advances when the
+    /// test body calls [`TestClock::advance`], so every assertion is
+    /// deterministic and free of sleeps.
+    struct Harness {
+        schedule: Scheduler<u32>,
+        clock: TestClock,
+    }
+
+    impl Harness {
+        fn new() -> Self {
+            let clock = TestClock::new(Utc::now());
+            let schedule = spawn_scheduler::<u32>(16, Arc::new(clock.clone()));
+
+            Self { schedule, clock }
+        }
+
+        /// Advance the clock, tick every activity, then return the ids the
+        /// scheduler considers due. The intermediate `snapshot` is a sync
+        /// barrier: because the actor is a single FIFO task, awaiting any
+        /// command guarantees the fire-and-forget `tick` was applied first.
+        async fn advance_and_claim(&self, by: Duration) -> Vec<u32> {
+            self.clock.advance(by);
+            self.schedule.tick().await;
+            let mut ids = self.schedule.claim_due().await;
+            ids.sort();
+            ids
+        }
+
+        async fn state_of(&self, id: u32) -> Option<ActivityState> {
+            self.schedule
+                .snapshot()
+                .await
+                .into_iter()
+                .find(|a| a.spec.id == id)
+                .map(|a| a.state)
+        }
+
+        async fn ids(&self) -> Vec<u32> {
+            let mut ids: Vec<u32> = self
+                .schedule
+                .snapshot()
+                .await
+                .into_iter()
+                .map(|a| a.spec.id)
+                .collect();
+            ids.sort();
+            ids
+        }
+
+        async fn shutdown(self) {
+            self.schedule.shutdown().await;
+        }
+    }
+
+    // ---- register ---------------------------------------------------------
+
+    #[tokio::test]
+    async fn register_succeeds_and_appears_in_snapshot() {
+        let h = Harness::new();
+
+        let result = h.schedule.register(spec(1, fixed(60))).await;
+
+        assert!(result.is_ok());
+        assert_eq!(h.ids().await, vec![1]);
+        assert_eq!(h.state_of(1).await, Some(ActivityState::Idle));
+
+        h.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn register_duplicate_id_returns_error() {
+        let h = Harness::new();
+        h.schedule.register(spec(1, fixed(60))).await.unwrap();
+
+        let result = h.schedule.register(spec(1, fixed(999))).await;
+
+        assert!(matches!(
+            result,
+            Err(SchedulerError::ActivityAlreadyRegistered)
+        ));
+        // The original registration is left untouched.
+        assert_eq!(h.ids().await, vec![1]);
+
+        h.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn register_many_registers_every_spec() {
+        let h = Harness::new();
+
+        let result = h
+            .schedule
+            .register_many(vec![
+                spec(1, fixed(60)),
+                spec(2, fixed(120)),
+                spec(3, fixed(180)),
+            ])
+            .await;
+
+        assert!(result.is_ok());
+        assert_eq!(h.ids().await, vec![1, 2, 3]);
+
+        h.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn register_many_with_duplicate_returns_error() {
+        let h = Harness::new();
+        h.schedule.register(spec(1, fixed(60))).await.unwrap();
+
+        let result = h
+            .schedule
+            .register_many(vec![spec(2, fixed(60)), spec(1, fixed(60))])
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(SchedulerError::ActivityAlreadyRegistered)
+        ));
+
+        h.shutdown().await;
+    }
+
+    // ---- claim_due / tick -------------------------------------------------
+
+    #[tokio::test]
+    async fn claim_due_is_empty_with_no_activities() {
+        let h = Harness::new();
+
+        assert!(h.schedule.claim_due().await.is_empty());
+
+        h.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn activity_not_claimed_before_interval_elapses() {
+        let h = Harness::new();
+        h.schedule.register(spec(1, fixed(100))).await.unwrap();
+
+        let due = h.advance_and_claim(Duration::from_secs(99)).await;
+
+        assert!(due.is_empty());
+        assert_eq!(h.state_of(1).await, Some(ActivityState::Idle));
+
+        h.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn activity_claimed_once_interval_elapses() {
+        let h = Harness::new();
+        h.schedule.register(spec(1, fixed(100))).await.unwrap();
+
+        let due = h.advance_and_claim(Duration::from_secs(100)).await;
+
+        assert_eq!(due, vec![1]);
+        assert_eq!(h.state_of(1).await, Some(ActivityState::Running));
+
+        h.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn claimed_activity_is_not_reclaimed_until_finished() {
+        let h = Harness::new();
+        h.schedule.register(spec(1, fixed(100))).await.unwrap();
+
+        let first = h.advance_and_claim(Duration::from_secs(100)).await;
+        assert_eq!(first, vec![1]);
+
+        // Still Running, so a further tick + claim yields nothing.
+        let second = h.advance_and_claim(Duration::from_secs(100)).await;
+        assert!(second.is_empty());
+
+        h.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn claim_due_returns_only_the_activities_that_are_due() {
+        let h = Harness::new();
+        h.schedule
+            .register_many(vec![spec(1, fixed(50)), spec(2, fixed(200))])
+            .await
+            .unwrap();
+
+        let due = h.advance_and_claim(Duration::from_secs(100)).await;
+
+        assert_eq!(
+            due,
+            vec![1],
+            "only the 50s activity should be due at t=100s"
+        );
+        assert_eq!(h.state_of(1).await, Some(ActivityState::Running));
+        assert_eq!(h.state_of(2).await, Some(ActivityState::Idle));
+
+        h.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn random_interval_is_not_due_below_min_and_due_at_max() {
+        let h = Harness::new();
+        h.schedule
+            .register(spec(
+                1,
+                ActivitySchedule::RandomInterval {
+                    min: Duration::from_secs(10),
+                    max: Duration::from_secs(20),
+                },
+            ))
+            .await
+            .unwrap();
+
+        // Below the minimum the target can never have been reached.
+        assert!(h.advance_and_claim(Duration::from_secs(9)).await.is_empty());
+        // At/above the maximum the target is guaranteed to have been reached.
+        assert_eq!(h.advance_and_claim(Duration::from_secs(11)).await, vec![1]);
+
+        h.shutdown().await;
+    }
+
+    // ---- set_enabled ------------------------------------------------------
+
+    #[tokio::test]
+    async fn disabled_activity_does_not_accumulate_and_is_not_due() {
+        let h = Harness::new();
+        h.schedule.register(spec(1, fixed(100))).await.unwrap();
+        h.schedule.set_enabled(1, false).await;
+
+        let due = h.advance_and_claim(Duration::from_secs(100)).await;
+
+        assert!(due.is_empty());
+        assert_eq!(
+            h.state_of(1).await,
+            Some(ActivityState::Disabled(Box::new(ActivityState::Idle)))
+        );
+
+        h.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn re_enabled_activity_resumes_scheduling() {
+        let h = Harness::new();
+        h.schedule.register(spec(1, fixed(100))).await.unwrap();
+
+        h.schedule.set_enabled(1, false).await;
+        assert!(
+            h.advance_and_claim(Duration::from_secs(100))
+                .await
+                .is_empty()
+        );
+
+        h.schedule.set_enabled(1, true).await;
+        // The disabled window did not accumulate, so it must elapse afresh.
+        let due = h.advance_and_claim(Duration::from_secs(100)).await;
+
+        assert_eq!(due, vec![1]);
+
+        h.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn set_enabled_on_unknown_id_is_a_noop() {
+        let h = Harness::new();
+
+        h.schedule.set_enabled(42, false).await;
+
+        // Reaching here (snapshot replies) proves the actor did not panic.
+        assert!(h.ids().await.is_empty());
+
+        h.shutdown().await;
+    }
+
+    // ---- finish -----------------------------------------------------------
+
+    #[tokio::test]
+    async fn finish_done_reschedules_a_fixed_interval_activity() {
+        let h = Harness::new();
+        h.schedule.register(spec(1, fixed(100))).await.unwrap();
+
+        assert_eq!(h.advance_and_claim(Duration::from_secs(100)).await, vec![1]);
+        h.schedule.finish(1, AckMessage::Done).await;
+
+        assert_eq!(h.state_of(1).await, Some(ActivityState::Idle));
+        // After re-elapsing the interval it becomes due again.
+        assert_eq!(h.advance_and_claim(Duration::from_secs(100)).await, vec![1]);
+
+        h.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn finish_snooze_reschedules_for_the_snooze_duration() {
+        let h = Harness::new();
+        h.schedule.register(spec(1, fixed(100))).await.unwrap();
+        assert_eq!(h.advance_and_claim(Duration::from_secs(100)).await, vec![1]);
+
+        h.schedule
+            .finish(1, AckMessage::Snooze(Duration::from_secs(30)))
+            .await;
+        assert_eq!(
+            h.state_of(1).await,
+            Some(ActivityState::Snoozed(Duration::from_secs(30)))
+        );
+
+        // Not due before the snooze elapses, due once it does.
+        assert!(
+            h.advance_and_claim(Duration::from_secs(29))
+                .await
+                .is_empty()
+        );
+        assert_eq!(h.advance_and_claim(Duration::from_secs(1)).await, vec![1]);
+
+        h.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn finish_done_on_scheduled_activity_removes_it() {
+        let start = Utc::now();
+        let clock = TestClock::new(start);
+        let token = CancellationToken::new();
+        let schedule = spawn_scheduler::<u32>(16, Arc::new(clock.clone()));
+
+        let target = start + chrono::Duration::seconds(100);
+        schedule
+            .register(spec(1, ActivitySchedule::Scheduled { date: target }))
+            .await
+            .unwrap();
+
+        clock.advance(Duration::from_secs(100));
+        schedule.tick().await;
+        assert_eq!(schedule.claim_due().await, vec![1]);
+
+        schedule.finish(1, AckMessage::Done).await;
+
+        // A completed one-shot activity is dropped from the scheduler.
+        assert!(schedule.snapshot().await.is_empty());
+
+        token.cancel();
+    }
+
+    #[tokio::test]
+    async fn ticking_disabled_scheduled_task_past_target_garbage_collects() {
+        let start = Utc::now();
+        let clock = TestClock::new(start);
+        let token = CancellationToken::new();
+        let schedule = spawn_scheduler::<u32>(16, Arc::new(clock.clone()));
+
+        let target = start + chrono::Duration::seconds(100);
+        schedule
+            .register(spec(1, ActivitySchedule::Scheduled { date: target }))
+            .await
+            .unwrap();
+
+        let _ = schedule.set_enabled(1, false).await;
+
+        clock.advance(Duration::from_secs(50));
+        schedule.tick().await;
+
+        assert_eq!(schedule.snapshot().await.len(), 1);
+        assert_eq!(schedule.claim_due().await.len(), 0);
+
+        clock.advance(Duration::from_secs(51));
+        schedule.tick().await;
+
+        assert_eq!(schedule.snapshot().await.len(), 0);
+        assert_eq!(schedule.claim_due().await.len(), 0);
+
+        schedule.shutdown();
+    }
+
+    #[tokio::test]
+    async fn finish_snooze_on_scheduled_activity_keeps_it() {
+        let start = Utc::now();
+        let clock = TestClock::new(start);
+        let schedule = spawn_scheduler::<u32>(16, Arc::new(clock.clone()));
+
+        let target = start + chrono::Duration::seconds(100);
+        schedule
+            .register(spec(1, ActivitySchedule::Scheduled { date: target }))
+            .await
+            .unwrap();
+
+        clock.advance(Duration::from_secs(100));
+        schedule.tick().await;
+        assert_eq!(schedule.claim_due().await, vec![1]);
+
+        schedule
+            .finish(1, AckMessage::Snooze(Duration::from_secs(30)))
+            .await;
+
+        let state = schedule
+            .snapshot()
+            .await
+            .into_iter()
+            .find(|a| a.spec.id == 1)
+            .map(|a| a.state);
+        assert_eq!(state, Some(ActivityState::Snoozed(Duration::from_secs(30))));
+
+        schedule.shutdown();
+    }
+
+    #[tokio::test]
+    async fn finish_on_unknown_id_is_a_noop() {
+        let h = Harness::new();
+        h.schedule.register(spec(1, fixed(100))).await.unwrap();
+
+        h.schedule.finish(99, AckMessage::Done).await;
+
+        assert_eq!(h.ids().await, vec![1]);
+        assert_eq!(h.state_of(1).await, Some(ActivityState::Idle));
+
+        h.shutdown().await;
+    }
+
+    // ---- snapshot & lifecycle --------------------------------------------
+
+    #[tokio::test]
+    async fn snapshot_returns_all_registered_activities() {
+        let h = Harness::new();
+        h.schedule
+            .register_many(vec![spec(1, fixed(60)), spec(2, fixed(120))])
+            .await
+            .unwrap();
+
+        let snapshot = h.schedule.snapshot().await;
+
+        assert_eq!(snapshot.len(), 2);
+
+        h.shutdown().await;
+    }
 }

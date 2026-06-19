@@ -4,8 +4,7 @@ use std::{
     time::Duration,
 };
 
-
-use ritualist::{RunningRitualist, activity::ActivityId};
+use ritualist::{RunningRitualist, activity::ActivityId, schedule::WithScheduler};
 use tokio::{sync::Mutex, time::sleep};
 
 struct Frame {
