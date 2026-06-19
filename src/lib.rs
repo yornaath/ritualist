@@ -111,6 +111,8 @@ where
         RitualistBuilder::new()
     }
 
+    /// Create a new ritualist instance.
+    /// However the builder() pattern is preffered.
     pub fn new(buffer_size: usize, poll_interval: Duration, clock: Arc<dyn Clock>) -> Ritualist<T> {
         let scheduler = spawn_scheduler(buffer_size, clock);
         let driver = ScheduleDriver::new(buffer_size, poll_interval);
