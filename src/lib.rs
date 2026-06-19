@@ -29,6 +29,7 @@ pub mod schedule;
 /// ```no_run
 /// use ritualist::{
 ///     Ritualist,
+///     WithScheduler,
 ///     ack::AckMessage,
 ///     activity_spec::{ActivitySchedule, ActivitySpec},
 /// };
