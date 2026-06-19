@@ -79,8 +79,8 @@ pub mod schedule;
 ///         .await
 ///         .expect("invalid activity spec");
 ///
-///     // Take the receiving end *before* starting the scheduler.
-///     let mut channel = ritualist.run().take_channel();
+///     // Start the ritualist, returning a running ritualist and the activity channel
+///     let (_, mut channel) = ritualist.run();
 ///
 ///     // Listen to activities being started
 ///     while let Some((activity, ack)) = channel.recv().await {
@@ -128,15 +128,17 @@ where
     ///
     /// Consumes self and [`crate::RunningRitualist`]
     /// Typesafe pattern Where Ritualist::run() -> RunningRitualist that cannot be run again.
-    pub fn run(mut self) -> RunningRitualist<T> {
+    pub fn run(mut self) -> (RunningRitualist<T>, Receiver<(T, Sender<AckMessage>)>) {
         let schedule = self.scheduler.clone();
         let receiver = self.driver.run(schedule);
 
-        RunningRitualist {
-            receiver: Some(receiver),
-            scheduler: self.scheduler,
-            driver: self.driver,
-        }
+        (
+            RunningRitualist {
+                scheduler: self.scheduler,
+                driver: self.driver,
+            },
+            receiver,
+        )
     }
 }
 
@@ -151,7 +153,6 @@ pub struct RunningRitualist<T>
 where
     T: ActivityId,
 {
-    receiver: Option<Receiver<(T, Sender<AckMessage>)>>,
     scheduler: Scheduler<T>,
     driver: ScheduleDriver,
 }
@@ -159,10 +160,6 @@ impl<T> RunningRitualist<T>
 where
     T: ActivityId,
 {
-    pub fn take_channel(&mut self) -> Receiver<(T, Sender<AckMessage>)> {
-        self.receiver.take().unwrap()
-    }
-
     pub async fn shutdown(self) -> Result<(), tokio::task::JoinError> {
         self.driver.shutdown().await?;
         self.scheduler.shutdown().await?;

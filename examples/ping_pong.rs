@@ -58,7 +58,7 @@ async fn main() -> Result<()> {
         .await
         .expect("Could not put activities onto ritualist.");
 
-    let mut channel = ritualist.run().take_channel();
+    let (_, mut channel) = ritualist.run();
 
     let listener = tokio::spawn(async move {
         while let Some((activity, ack)) = channel.recv().await {

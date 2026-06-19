@@ -55,8 +55,7 @@ async fn main() -> Result<()> {
         .await
         .expect("Could not put activities onto ritualist.");
 
-    let mut runner = ritualist.run();
-    let mut channel = runner.take_channel();
+    let (runner, mut channel) = ritualist.run();
 
     let ritualist = Arc::new(Mutex::new(runner));
 
