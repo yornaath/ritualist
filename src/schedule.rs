@@ -4,17 +4,15 @@ use crate::{
     activity_spec::ActivitySpec,
     clock::Clock,
 };
-use std::{collections::HashMap, fmt::Debug, sync::Arc, time::Duration};
-use chrono::Duration;
+use std::{collections::HashMap, fmt::Debug, sync::Arc};
 use tokio::{
     select,
     sync::{
         mpsc::{self},
         oneshot,
     },
-    task::{JoinHandle, JoinSet},
+    task::{JoinHandle},
 };
-use tokio_util::sync::CancellationToken;
 
 #[derive(Debug)]
 enum Command<T: ActivityId> {
@@ -69,7 +67,10 @@ where
 
     pub async fn register_many(&self, specs: Vec<ActivitySpec<T>>) -> Result<(), SchedulerError> {
         let (reply, rx) = oneshot::channel();
-        let _ = self.actor_tx.send(Command::RegisterMany { specs, reply }).await;
+        let _ = self
+            .actor_tx
+            .send(Command::RegisterMany { specs, reply })
+            .await;
         rx.await.unwrap()
     }
 
@@ -86,12 +87,20 @@ where
     }
 
     pub async fn set_enabled(&self, id: T, enabled: bool) {
-        let _ = self.actor_tx.send(Command::SetEnabled { id, enabled }).await;
+        let _ = self
+            .actor_tx
+            .send(Command::SetEnabled { id, enabled })
+            .await;
     }
 
     pub async fn claim_due(&self) -> Vec<T> {
         let (reply, rx) = oneshot::channel();
-        if self.actor_tx.send(Command::ClaimDue { reply }).await.is_err() {
+        if self
+            .actor_tx
+            .send(Command::ClaimDue { reply })
+            .await
+            .is_err()
+        {
             return Vec::new();
         }
         rx.await.unwrap_or_default()
@@ -103,62 +112,16 @@ where
 
     pub async fn snapshot(&self) -> Vec<Activity<T>> {
         let (reply, rx) = oneshot::channel();
-        if self.actor_tx.send(Command::Snapshot { reply }).await.is_err() {
+        if self
+            .actor_tx
+            .send(Command::Snapshot { reply })
+            .await
+            .is_err()
+        {
             return Vec::new();
         }
         rx.await.unwrap_or_default()
     }
-
-    pub fn run(&self, poll_interval: Duration, cancel_token: CancellationToken) {
-        let mut ticker = tokio::time::interval(poll_interval);
-
-        let handle = tokio::spawn({
-            let cancel_token = cancel_token.clone();
-            async move {
-                let mut dispatch = JoinSet::<()>::new();
-
-                loop {
-                    select! {
-                        _ = cancel_token.cancelled() => break,
-                        _ = ticker.tick() => {
-                            self.tick().await;
-
-                            let due = self.claim_due().await;
-
-                            for id in due {
-                                let sender = sender.clone();
-                                let schedule = self.clone();
-
-                                dispatch.spawn(async move {
-                                    let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
-
-                                    let _ = sender.send((id, ack_tx)).await;
-                                    let outcome = ack_rx.await.unwrap_or(AckMessage::Done);
-
-                                    schedule.finish(id, outcome).await;
-                                });
-                            }
-                        },
-                        Some(_) = dispatch.join_next() => {}
-                    }
-                }
-
-                let _ = tokio::time::timeout(Duration::from_secs(5), async {
-                    while dispatch.join_next().await.is_some() {}
-                })
-                .await;
-
-                dispatch.abort_all();
-
-                while dispatch.join_next().await.is_some() {}
-            }
-        });
-    }
-}
-
-pub struct ScheduleDriver<T: ActivityId> {
-    sender: tokio::sync::mpsc::Sender<Ack<T>>,
-    receiver: Option<tokio::sync::mpsc::Receiver<Ack<T>>>,
 }
 
 struct SchedulerActor<T>

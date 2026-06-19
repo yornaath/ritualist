@@ -1,9 +1,5 @@
 use crate::{
-    ack::{Ack, AckMessage},
-    activity::{Activity, ActivityId},
-    activity_spec::{ActivitySpec, ActivitySpecError},
-    clock::{Clock, SystemClock},
-    schedule::{Scheduler, SchedulerError, spawn_scheduler},
+    ack::{Ack, AckMessage}, activity::{Activity, ActivityId}, activity_spec::{ActivitySpec, ActivitySpecError}, clock::{Clock, SystemClock}, driver::ScheduleDriver, schedule::{Scheduler, SchedulerError, spawn_scheduler}
 };
 use std::{ops::Deref, sync::Arc, time::Duration};
 use tokio::{
@@ -18,6 +14,7 @@ pub mod activity;
 pub mod activity_spec;
 pub mod clock;
 pub mod schedule;
+mod driver;
 
 /// Ritualist
 ///
@@ -154,6 +151,8 @@ where
         let mut ticker = tokio::time::interval(poll_interval);
         let cancellation_token = self.cancellation_token.clone();
         let poll_token = self.cancellation_token.child_token();
+
+        let a = ScheduleDriver::new(buffer_size, poll_interval, cancellation_token)
 
         let handle = tokio::spawn({
             let poll_token = poll_token.clone();
