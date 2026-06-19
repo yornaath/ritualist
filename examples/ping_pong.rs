@@ -39,7 +39,7 @@ impl Activity {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let ritualist = Ritualist::builder().build();
+    let ritualist = Ritualist::builder().buffer_size(64).build();
 
     ritualist
         .register_many(vec![

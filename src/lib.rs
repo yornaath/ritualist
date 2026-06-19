@@ -146,7 +146,7 @@ impl<T: ActivityId> WithScheduler<T> for Ritualist<T> {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct RitualistBuilder<T: ActivityId> {
     buffer_size: usize,
     poll_interval: Duration,
@@ -164,21 +164,26 @@ impl<T: ActivityId> RitualistBuilder<T> {
         }
     }
 
-    pub fn buffer_size(&mut self, buffer_size: usize) -> &Self {
+    pub fn buffer_size(mut self, buffer_size: usize) -> Self {
         self.buffer_size = buffer_size;
-        self
+        self.clone()
     }
 
-    pub fn poll_interval(&mut self, interval: Duration) -> &Self {
+    /// How often the scheduler will check for due activities to run.
+    /// Defaults to 500ms, meaning no [`Activity`] can run more often than this.
+    pub fn poll_interval(mut self, interval: Duration) -> Self {
         self.poll_interval = interval;
-        self
+        self.clone()
     }
 
-    pub fn clock(&mut self, clock: Arc<dyn Clock>) -> &Self {
+    /// Set the clock for the scheduler, impl [`Clock`]
+    /// Mostly handy for testing.
+    pub fn clock(mut self, clock: Arc<dyn Clock>) -> Self {
         self.clock = clock;
-        self
+        self.clone()
     }
 
+    /// Consume the builder and create a Ritualist instance.
     pub fn build(self) -> Ritualist<T> {
         Ritualist::new(self.buffer_size, self.poll_interval, self.clock)
     }
