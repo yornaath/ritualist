@@ -3,7 +3,7 @@ use crate::{
     activity::{Activity, ActivityId},
     activity_spec::{ActivitySpec, ActivitySpecError},
     clock::{Clock, SystemClock},
-    schedule::{Schedule, SchedulerError, spawn_scheduler},
+    schedule::{Scheduler, SchedulerError, spawn_scheduler},
 };
 use std::{ops::Deref, sync::Arc, time::Duration};
 use tokio::{
@@ -274,7 +274,7 @@ pub struct SchedulerHandle<T>
 where
     T: ActivityId,
 {
-    scheduler: Schedule<T>,
+    scheduler: Scheduler<T>,
 }
 
 impl<T> SchedulerHandle<T>

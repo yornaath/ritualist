@@ -1,18 +1,20 @@
 use crate::{
-    ack::AckMessage,
+    ack::{Ack, AckMessage},
     activity::{Activity, ActivityId, ActivityState},
     activity_spec::ActivitySpec,
     clock::Clock,
 };
-use std::{collections::HashMap, fmt::Debug, sync::Arc};
+use std::{collections::HashMap, fmt::Debug, sync::Arc, time::Duration};
+use chrono::Duration;
 use tokio::{
     select,
     sync::{
         mpsc::{self},
         oneshot,
     },
-    task::JoinHandle,
+    task::{JoinHandle, JoinSet},
 };
+use tokio_util::sync::CancellationToken;
 
 #[derive(Debug)]
 enum Command<T: ActivityId> {
@@ -48,67 +50,118 @@ enum Command<T: ActivityId> {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct Schedule<T>
+pub(crate) struct Scheduler<T>
 where
     T: ActivityId,
 {
-    tx: mpsc::Sender<Command<T>>,
+    actor_tx: mpsc::Sender<Command<T>>,
 }
 
-impl<T> Schedule<T>
+impl<T> Scheduler<T>
 where
     T: ActivityId,
 {
     pub async fn register(&self, spec: ActivitySpec<T>) -> Result<(), SchedulerError> {
         let (reply, rx) = oneshot::channel();
-        let _ = self.tx.send(Command::Register { spec, reply }).await;
+        let _ = self.actor_tx.send(Command::Register { spec, reply }).await;
         rx.await.unwrap()
     }
 
     pub async fn register_many(&self, specs: Vec<ActivitySpec<T>>) -> Result<(), SchedulerError> {
         let (reply, rx) = oneshot::channel();
-        let _ = self.tx.send(Command::RegisterMany { specs, reply }).await;
+        let _ = self.actor_tx.send(Command::RegisterMany { specs, reply }).await;
         rx.await.unwrap()
     }
 
     pub async fn reset(&self, spec: ActivitySpec<T>) {
-        let _ = self.tx.send(Command::Reset { spec }).await;
+        let _ = self.actor_tx.send(Command::Reset { spec }).await;
     }
 
     pub async fn reset_many(&self, specs: Vec<ActivitySpec<T>>) {
-        let _ = self.tx.send(Command::ResetMany { specs }).await;
+        let _ = self.actor_tx.send(Command::ResetMany { specs }).await;
     }
 
     pub async fn tick(&self) {
-        let _ = self.tx.send(Command::Tick).await;
+        let _ = self.actor_tx.send(Command::Tick).await;
     }
 
     pub async fn set_enabled(&self, id: T, enabled: bool) {
-        let _ = self.tx.send(Command::SetEnabled { id, enabled }).await;
+        let _ = self.actor_tx.send(Command::SetEnabled { id, enabled }).await;
     }
 
     pub async fn claim_due(&self) -> Vec<T> {
         let (reply, rx) = oneshot::channel();
-        if self.tx.send(Command::ClaimDue { reply }).await.is_err() {
+        if self.actor_tx.send(Command::ClaimDue { reply }).await.is_err() {
             return Vec::new();
         }
         rx.await.unwrap_or_default()
     }
 
     pub async fn finish(&self, id: T, ack: AckMessage) {
-        let _ = self.tx.send(Command::Finish { id, ack }).await;
+        let _ = self.actor_tx.send(Command::Finish { id, ack }).await;
     }
 
     pub async fn snapshot(&self) -> Vec<Activity<T>> {
         let (reply, rx) = oneshot::channel();
-        if self.tx.send(Command::Snapshot { reply }).await.is_err() {
+        if self.actor_tx.send(Command::Snapshot { reply }).await.is_err() {
             return Vec::new();
         }
         rx.await.unwrap_or_default()
     }
+
+    pub fn run(&self, poll_interval: Duration, cancel_token: CancellationToken) {
+        let mut ticker = tokio::time::interval(poll_interval);
+
+        let handle = tokio::spawn({
+            let cancel_token = cancel_token.clone();
+            async move {
+                let mut dispatch = JoinSet::<()>::new();
+
+                loop {
+                    select! {
+                        _ = cancel_token.cancelled() => break,
+                        _ = ticker.tick() => {
+                            self.tick().await;
+
+                            let due = self.claim_due().await;
+
+                            for id in due {
+                                let sender = sender.clone();
+                                let schedule = self.clone();
+
+                                dispatch.spawn(async move {
+                                    let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+
+                                    let _ = sender.send((id, ack_tx)).await;
+                                    let outcome = ack_rx.await.unwrap_or(AckMessage::Done);
+
+                                    schedule.finish(id, outcome).await;
+                                });
+                            }
+                        },
+                        Some(_) = dispatch.join_next() => {}
+                    }
+                }
+
+                let _ = tokio::time::timeout(Duration::from_secs(5), async {
+                    while dispatch.join_next().await.is_some() {}
+                })
+                .await;
+
+                dispatch.abort_all();
+
+                while dispatch.join_next().await.is_some() {}
+            }
+        });
+    }
 }
 
-struct ScheduleActor<T>
+pub struct ScheduleDriver<T: ActivityId> {
+    sender: tokio::sync::mpsc::Sender<Ack<T>>,
+    receiver: Option<tokio::sync::mpsc::Receiver<Ack<T>>>,
+}
+
+struct SchedulerActor<T>
 where
     T: ActivityId,
 {
@@ -116,7 +169,7 @@ where
     clock: Arc<dyn Clock>,
 }
 
-impl<T> ScheduleActor<T>
+impl<T> SchedulerActor<T>
 where
     T: ActivityId,
 {
@@ -209,14 +262,14 @@ pub(crate) fn spawn_scheduler<T>(
     buffer: usize,
     cancellation_token: tokio_util::sync::CancellationToken,
     clock: Arc<dyn Clock>,
-) -> (Schedule<T>, JoinHandle<()>)
+) -> (Scheduler<T>, JoinHandle<()>)
 where
     T: ActivityId,
 {
     let (tx, mut rx) = mpsc::channel::<Command<T>>(buffer);
 
     let handle = tokio::spawn(async move {
-        let mut actor = ScheduleActor {
+        let mut actor = SchedulerActor {
             activities: HashMap::new(),
             clock: clock,
         };
@@ -232,7 +285,7 @@ where
         }
     });
 
-    (Schedule { tx }, handle)
+    (Scheduler { actor_tx: tx }, handle)
 }
 
 #[cfg(test)]
@@ -263,7 +316,7 @@ mod tests {
     /// test body calls [`TestClock::advance`], so every assertion is
     /// deterministic and free of sleeps.
     struct Harness {
-        schedule: Schedule<u32>,
+        schedule: Scheduler<u32>,
         clock: TestClock,
         token: CancellationToken,
         handle: JoinHandle<()>,
