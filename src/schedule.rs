@@ -256,7 +256,7 @@ where
         async move {
             let mut actor = SchedulerActor {
                 activities: HashMap::new(),
-                clock: clock,
+                clock,
             };
 
             loop {

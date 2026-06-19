@@ -69,7 +69,7 @@ where
             last_tick: clock.now(),
             last_run_at: None,
             created_at: clock.now_utc(),
-            clock: clock,
+            clock,
         }
     }
 
@@ -102,7 +102,6 @@ where
             && self.is_at_target()
         {
             self.state = ActivityState::Gc;
-            return;
         }
     }
 

@@ -118,10 +118,7 @@ where
         let scheduler = spawn_scheduler(buffer_size, clock);
         let driver = ScheduleDriver::new(buffer_size, poll_interval);
 
-        let ritualist: Ritualist<T> = Ritualist {
-            scheduler: scheduler,
-            driver: driver,
-        };
+        let ritualist: Ritualist<T> = Ritualist { scheduler, driver };
 
         ritualist
     }
