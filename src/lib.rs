@@ -107,6 +107,7 @@ impl<T> Ritualist<T>
 where
     T: ActivityId,
 {
+    /// Start a new builder.
     pub fn builder() -> RitualistBuilder<T> {
         RitualistBuilder::new()
     }
