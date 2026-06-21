@@ -146,6 +146,40 @@ impl<T: ActivityId> WithScheduler<T> for Ritualist<T> {
     }
 }
 
+#[derive(Debug)]
+pub struct RunningRitualist<T>
+where
+    T: ActivityId,
+{
+    scheduler: Scheduler<T>,
+    driver: ScheduleDriver,
+}
+impl<T> RunningRitualist<T>
+where
+    T: ActivityId,
+{
+    /// Gracefully shut down the driver and scheduler.
+    /// Leaves som room for running tasks to finish.
+    pub async fn shutdown(self) -> Result<(), tokio::task::JoinError> {
+        self.driver.shutdown().await?;
+        self.scheduler.shutdown().await?;
+        Ok(())
+    }
+
+    /// Hard abort both driver and scheduler.
+    /// Will not leave room for activity tasks to finish.
+    pub async fn abort(self) {
+        self.driver.abort();
+        self.scheduler.abort();
+    }
+}
+
+impl<T: ActivityId> WithScheduler<T> for RunningRitualist<T> {
+    fn get_scheduler(&self) -> Scheduler<T> {
+        self.scheduler.clone()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct RitualistBuilder<T: ActivityId> {
     buffer_size: usize,
@@ -191,39 +225,5 @@ impl<T: ActivityId> RitualistBuilder<T> {
     /// Consume the builder and create a Ritualist instance.
     pub fn build(self) -> Ritualist<T> {
         Ritualist::new(self.buffer_size, self.poll_interval, self.clock)
-    }
-}
-
-#[derive(Debug)]
-pub struct RunningRitualist<T>
-where
-    T: ActivityId,
-{
-    scheduler: Scheduler<T>,
-    driver: ScheduleDriver,
-}
-impl<T> RunningRitualist<T>
-where
-    T: ActivityId,
-{
-    /// Gracefully shut down the driver and scheduler.
-    /// Leaves som room for running tasks to finish.
-    pub async fn shutdown(self) -> Result<(), tokio::task::JoinError> {
-        self.driver.shutdown().await?;
-        self.scheduler.shutdown().await?;
-        Ok(())
-    }
-
-    /// Hard abort both driver and scheduler.
-    /// Will not leave room for activity tasks to finish.
-    pub async fn abort(self) {
-        self.driver.abort();
-        self.scheduler.abort();
-    }
-}
-
-impl<T: ActivityId> WithScheduler<T> for RunningRitualist<T> {
-    fn get_scheduler(&self) -> Scheduler<T> {
-        self.scheduler.clone()
     }
 }
