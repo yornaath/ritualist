@@ -44,6 +44,9 @@ enum Command<T: ActivityId> {
     ClaimDue {
         reply: oneshot::Sender<Vec<T>>,
     },
+    SetImmediate {
+        id: T,
+    },
     Finish {
         id: T,
         ack: AckMessage,
@@ -112,6 +115,10 @@ where
             return Vec::new();
         }
         rx.await.unwrap_or_default()
+    }
+
+    pub async fn set_immediate(&self, id: T) {
+        let _ = self.actor_tx.send(Command::SetImmediate { id }).await;
     }
 
     pub async fn finish(&self, id: T, ack: AckMessage) {
@@ -220,6 +227,12 @@ where
                     }
                 }
                 let _ = reply.send(ids);
+            }
+
+            Command::SetImmediate { id } => {
+                if let Some(activity) = self.activities.get_mut(&id) {
+                    activity.set_immediate();
+                }
             }
 
             Command::Finish { id, ack } => {
@@ -345,6 +358,12 @@ where
     ///   if the activity is disabled when it should have fired.
     async fn set_enabled(&self, id: T, enabled: bool) {
         self.get_scheduler().set_enabled(id, enabled).await;
+    }
+
+    /// Dispatch a activity event.
+    /// Schedules an activity to run immediatly.
+    async fn dispatch(&self, id: T) {
+        self.get_scheduler().set_immediate(id).await;
     }
 
     /// Get a snapshot of the activities and their states currently in the scheduler
@@ -570,6 +589,38 @@ mod tests {
         );
         assert_eq!(h.state_of(1).await, Some(ActivityState::Running));
         assert_eq!(h.state_of(2).await, Some(ActivityState::Idle));
+
+        h.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn set_immediate_makes_duration_tasks_fire_immediatly_then_go_back_to_schedule() {
+        let h = Harness::new();
+        h.schedule
+            .register_many(vec![spec(1, fixed(50))])
+            .await
+            .unwrap();
+
+        let activity = h.schedule.snapshot().await[0].clone();
+        assert_eq!(activity.should_run(), false);
+
+        h.schedule.set_immediate(1).await;
+
+        let due = h.schedule.claim_due().await;
+        assert_eq!(due, vec![1]);
+        h.schedule.finish(1, AckMessage::Done).await;
+
+        h.clock.advance(Duration::from_millis(1));
+        h.schedule.tick().await;
+
+        let due = h.schedule.claim_due().await;
+        assert_eq!(due, vec![]);
+
+        h.clock.advance(Duration::from_secs(50));
+        h.schedule.tick().await;
+
+        let due = h.schedule.claim_due().await;
+        assert_eq!(due, vec![1]);
 
         h.shutdown().await;
     }

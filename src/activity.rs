@@ -163,6 +163,20 @@ where
         }
     }
 
+    /// Sets the activation target to be immediate.
+    /// For durations sets it to ZERO so it fires immediatly.
+    /// And for dates set its to NOW for same behavior
+    pub(crate) fn set_immediate(&mut self) {
+        match self.activation_target {
+            ActivationTarget::Duration(_) => {
+                self.activation_target = ActivationTarget::Duration(Duration::ZERO)
+            }
+            ActivationTarget::Date(_) => {
+                self.activation_target = ActivationTarget::Date(self.clock.now_utc())
+            }
+        };
+    }
+
     /// Apply the finish state transition to the activity
     ///
     /// Takes a [`AckMessage`] and transitions the activity into its correct state.
@@ -713,7 +727,8 @@ mod tests {
         activity.try_gc_mark();
 
         assert_eq!(
-            activity.state, ActivityState::Idle,
+            activity.state,
+            ActivityState::Idle,
             "an enabled scheduled activity must not be garbage collected"
         );
     }
