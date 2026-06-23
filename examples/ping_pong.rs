@@ -2,11 +2,10 @@ use ritualist::{
     Ritualist,
     ack::AckMessage,
     activity_spec::{ActivitySchedule, ActivitySpec},
-    clock::SystemClock,
     schedule::WithScheduler,
 };
-use std::{sync::Arc, thread::Result, time::Duration};
-use tokio::sync::{self, Mutex};
+use std::{thread::Result, time::Duration};
+use tokio::sync::{self};
 
 mod common;
 

@@ -71,34 +71,43 @@ use ritualist::{
     Ritualist,
     ack::AckMessage,
     activity_spec::{ActivitySchedule, ActivitySpec},
+    schedule::WithScheduler,
 };
-use std::time::Duration;
-use tokio::sync;
+use std::{thread::Result, time::Duration};
+use tokio::sync::{self};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-enum Activity {
+mod common;
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Copy)]
+pub enum Activity {
     Ping,
     Pong,
 }
 
 impl Activity {
-    fn run(&self, ack: sync::oneshot::Sender<AckMessage>) {
-        let activity = *self;
-        tokio::spawn(async move {
-            match activity {
-                Activity::Ping => println!("pinged"),
-                Activity::Pong => println!("ponged"),
+    pub fn run(&self, ack: sync::oneshot::Sender<AckMessage>) {
+        tokio::spawn({
+            let activity = self.clone();
+
+            async move {
+                match activity {
+                    Activity::Ping => {
+                        println!("pinged");
+                    }
+                    Activity::Pong => {
+                        println!("ponged");
+                    }
+                }
+
+                let _ = ack.send(AckMessage::Done);
             }
-            // Acknowledge the run so the activity gets re-scheduled.
-            let _ = ack.send(AckMessage::Done);
         });
     }
 }
 
 #[tokio::main]
-async fn main() {
-    // buffer = channel capacity, poll_interval = how often the scheduler ticks.
-    let mut ritualist = Ritualist::builder().build();
+async fn main() -> Result<()> {
+    let ritualist = Ritualist::builder().buffer_size(64).build();
 
     ritualist
         .register_many(vec![
@@ -116,15 +125,19 @@ async fn main() {
             },
         ])
         .await
-        .expect("invalid activity spec");
+        .expect("Could not put activities onto ritualist.");
 
-    // Take the receiving end *before* starting the scheduler.
-    let mut channel = ritualist.take_channel();
-    ritualist.run();
+    let (_, mut channel) = ritualist.run();
 
-    while let Some((activity, ack)) = channel.recv().await {
-        activity.run(ack);
-    }
+    let listener = tokio::spawn(async move {
+        while let Some((activity, ack)) = channel.recv().await {
+            activity.run(ack);
+        }
+    });
+
+    let _ = listener.await;
+
+    Ok(())
 }
 ```
 
