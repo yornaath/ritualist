@@ -1,7 +1,5 @@
 use chrono::{DateTime, Utc};
-use std::{
-    fmt::Debug,
-};
+use std::fmt::Debug;
 
 /// A monotonic point in time, re-exported from [`tokio::time::Instant`].
 ///
@@ -67,7 +65,6 @@ impl Clock for SystemClock {
     }
 }
 
-
 #[cfg(any(test, feature = "test-util"))]
 use std::{
     sync::{Arc, Mutex},
@@ -123,7 +120,7 @@ impl TestClock {
             })),
         }
     }
-    
+
     /// Moves both views forward by `by`; observed by all clones.
     ///
     /// Panics if `by` is out of range for [`chrono::Duration`].

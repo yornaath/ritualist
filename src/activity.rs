@@ -35,6 +35,7 @@ where
     clock: Arc<dyn Clock>,
 }
 
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Debug, Clone, PartialEq)]
 pub enum ActivityState {
     Idle,
@@ -92,7 +93,7 @@ where
         self.try_gc_mark()
     }
 
-    /// Mark the activity as garbace collectable if the task meets the conditions:
+    /// Mark the activity as garbage collectable if the task meets the conditions:
     /// - It is a schedule Date activity
     /// - And the activity is disabled
     /// - And the activity has reached its target date.

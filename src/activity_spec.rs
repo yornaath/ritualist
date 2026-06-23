@@ -4,6 +4,7 @@ use std::{hash::Hash, time::Duration};
 
 use crate::{activation_target::ActivationTarget, activity::ActivityId};
 
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Debug, Clone)]
 pub struct ActivitySpec<T: ActivityId> {
     /// The id of the activity [`ActivityId` = Debug + Eq + Hash + Copy + Send + 'static ]
@@ -33,6 +34,7 @@ where
     }
 }
 
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Copy)]
 pub enum ActivitySchedule {
     FixedInterval { duration: Duration },
