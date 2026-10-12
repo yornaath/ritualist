@@ -9,7 +9,7 @@ use std::{marker::PhantomData, sync::Arc, time::Duration};
 use tokio::sync::{mpsc::Receiver, oneshot::Sender};
 
 pub mod ack;
-mod activation_target;
+pub mod activation_target;
 pub mod activity;
 pub mod activity_spec;
 pub mod clock;
