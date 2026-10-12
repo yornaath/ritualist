@@ -11,6 +11,7 @@ pub trait ActivityId: Debug + Eq + Hash + Copy + Send + 'static {}
 impl<T: Debug + Eq + Hash + Copy + Send + 'static> ActivityId for T {}
 
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct Activity<T>
 where
     T: ActivityId,
@@ -26,16 +27,19 @@ where
     /// dates for scheduled tasks.
     pub activation_target: ActivationTarget,
     /// The last monotonic tick time
+    #[cfg_attr(feature = "serde", serde(skip))]
     pub last_tick: Instant,
     /// When the task last run, not used. But can be handy for consumers.
     pub last_run_at: Option<DateTime<Utc>>,
     /// When the task was created, not used. But can be handy for consumers.
     pub created_at: DateTime<Utc>,
     /// Internal clock used to schedule.
+    #[cfg_attr(feature = "serde", serde(skip))]
     clock: Arc<dyn Clock>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum ActivityState {
     Idle,
     Running,
@@ -805,5 +809,30 @@ mod tests {
         clock.advance(Duration::from_secs(50));
 
         assert!((activity.calculate_progress_pct() - 50.0).abs() < 1e-6);
+    }
+
+    // ---- serde ------------------------------------------------------------
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn activity_serializes_and_parts_round_trip() {
+        let clock = TestClock::new(Utc::now());
+        let mut activity = build(&clock, fixed(100));
+        activity.set_enabled(false);
+
+        let json = serde_json::to_value(&activity).unwrap();
+        assert!(json.get("last_tick").is_none());
+        assert!(json.get("clock").is_none());
+
+        let spec: ActivitySpec<u32> = serde_json::from_value(json["spec"].clone()).unwrap();
+        assert_eq!(spec.id, ID);
+        assert_eq!(spec.schedule, activity.spec.schedule);
+
+        let state: ActivityState = serde_json::from_value(json["state"].clone()).unwrap();
+        assert_eq!(state, activity.state);
+
+        let target: ActivationTarget =
+            serde_json::from_value(json["activation_target"].clone()).unwrap();
+        assert_eq!(target, activity.activation_target);
     }
 }

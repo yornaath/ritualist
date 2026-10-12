@@ -614,7 +614,7 @@ mod tests {
         h.schedule.tick().await;
 
         let due = h.schedule.claim_due().await;
-        assert_eq!(due, vec![]);
+        assert_eq!(due, Vec::<u32>::new());
 
         h.clock.advance(Duration::from_secs(50));
         h.schedule.tick().await;
